@@ -1,0 +1,10 @@
+{
+    "YOUR_DOMAIN" : "https://hlngs2024b.atlassian.net"
+    , "SPACE_KEY" : "HLNGSWESYS"
+    , "USERNAME" : "hlngs.bas@gmail.com"
+    , "PARENT_PAGE_ID" : {
+        "QA_PAGE_ID" : "94208001"  
+      , "PROD_PAGE_ID" : "87621709"
+    }
+}
+

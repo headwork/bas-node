@@ -11,6 +11,7 @@
 >npm install --save lodash
 >npm install --save deasync
 >npm install --save request-promise-native
+>npm uninstall stack-trace
 >```
 
 
