@@ -4,9 +4,10 @@ const fs = require('fs');
 const { merge } = require('webpack-merge')
 // const baseConfig = require('./webpack.config.base')
 
+const pjtPath = process.cwd();
+
 function baseOption(){
     console.log("__dirname = " + __dirname)
-    const pjtPath = process.cwd();
     console.log("pjtPath = " + pjtPath)
     return {
         module: {
@@ -77,6 +78,18 @@ function getJsFiles(dir) {
     return results;
 }
 
+function cleanFile(){
+    const regex = new RegExp("config|.+\.bat", "g");
+    let distPath = pjtPath + "\\dist";
+    // dist 폴더 내 모든 파일 삭제 (예외 파일 제외)
+    fs.readdirSync(distPath).forEach(file => {
+        if (!regex.test(file)) {
+            console.log("file = " + file);
+            fs.rmSync(path.join(distPath, file), { recursive: true, force: true });
+        }
+    });
+}
+
 /*
     hlng
 */
@@ -104,7 +117,7 @@ module.exports = (env, argv) => {
     }else if (argv.mode === 'production') {
       //...
     }
-  
+    cleanFile();
     config = merge(config, makerHlngOptions());
 
     return config;

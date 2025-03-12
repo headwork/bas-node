@@ -1,4 +1,5 @@
 const _util = require('./util/common');
+const _logger = _util.utilLogger;
 const _cflc = require('./util/confluence');
 
 let _config = {
@@ -11,11 +12,30 @@ let _config = {
     , TAG_DEPLOY : "TEST"
 }
 
-initConfig();
-console.log(callConfluencePage());
+function main(){
+    if(_logger.isDebug) _logger.debug("_config " + JSON.stringify(_config));
+    if(_config.ROOT_PATH == "page"){
+        console.log(callPageUpdate());
+    }else if(_config.DATA_PATH == "data.json"){
+        console.log(callDeploy());
+    }
+}
+
+function callPageUpdate(){
+    if(_config.TAG_DEPLOY == "LOCAL"){
+        _config.TAG_DEPLOY = "PROD";
+        _config.TAG_DEPLOY = "QA";
+    }
+    let pageKey = null;
+    pageKey = (_config.DATA_PATH || "").split(",",-1);
+    pageKey.forEach(element => {
+        if(element == "") return;
+        _cflc.updateRequestPage({..._config, pageId:element});
+    });
+}
 
 /* 배포이력등록 */
-function callConfluencePage(){
+function callDeploy(){
     let data = null;
     let result = "FAIL";
     let reqPageKeys = null;
@@ -60,7 +80,7 @@ function callConfluencePage(){
         });
     
     }catch(error){
-        console.log(JSON.stringify(error));
+        if(_logger.isError) _logger.error(error);
         console.error('API 호출 또는 JSON 파싱 오류:', error);
     };
     return result;
@@ -90,7 +110,7 @@ function initConfig(){
     // 사용자 이름과 API 토큰 결합
     let tmep = _util.getConfig("hlngs.json");
     _config = _util.marge(_config, tmep);
-    console.log(JSON.stringify(_config));
+
     let credentials = `${_config.USERNAME}:${_config.API_TOKEN}`;
     if(process.argv.length > 4){
         _config.API_TOKEN = process.argv[2];
@@ -127,3 +147,6 @@ function initConfig(){
     
     return "SUCCESS";
 }
+
+initConfig();
+main();
