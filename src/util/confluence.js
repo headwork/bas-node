@@ -74,6 +74,8 @@ let utilConfluence = (()=>{
                 console.error(`page[${param.pageId}] update error[${res.response.statusCode}]`);
         });
     }
+
+    /* 라벨이 개발완료일때 처리안함 */
     _that.updateRequestPage = function (param){
         let result = null;
         let jsonData = null;
@@ -154,7 +156,7 @@ let utilConfluence = (()=>{
     _that.changeDate = function (pageData, item){
         let content = pageData.body.storage.value;      
         let toVal = `<p><time datetime="${new Date().toISOString().split("T")[0]}" /><\/p>`
-        const regex = new RegExp(`(<th><p><strong>${completionDateText}<\/strong><\/p><\/th><td>)(<p>.*?<\/p>|<p \/>)(<\/td>)`);
+        const regex = new RegExp(`(<th><p><strong>${item}<\/strong><\/p><\/th><td>)(<p>.*?<\/p>|<p \/>)(<\/td>)`);
         pageData.body.storage.value = content.replace(regex, (match, p1, p2, p3) => {
             return `${p1}${toVal}${p3}`;
         });
@@ -250,6 +252,18 @@ let utilConfluence = (()=>{
                 });
         }
     }
+
+    _that.findContnetsKeys = (strCont) => {
+        const regex = new RegExp(`{key:(.*?)}`, "g");
+        let pageKey = [];
+        const matches = [...strCont.matchAll(regex)];
+        matches.forEach((match, index) => {
+            if(!pageKey.includes(match[1])) pageKey.push(match[1]);
+            // console.log(`인덱스 ${index}: ${match} `);
+        });
+        return pageKey;;
+    }
+
     return _that;
 })();
 

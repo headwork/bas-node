@@ -18,6 +18,7 @@ console.log(callConfluencePage());
 function callConfluencePage(){
     let data = null;
     let result = "FAIL";
+    let reqPageKeys = null;
     try {
         data = _util.utilFile.fileLoad(_config.ROOT_PATH + "\\" + _config.DATA_PATH);
         /* parent page id변경 */
@@ -27,6 +28,7 @@ function callConfluencePage(){
         }
         if(temp.body != null && temp.body.storage != null && temp.body.storage.value != null){
             let bodyValue = temp.body.storage.value || "";
+            reqPageKeys = _cflc.findContnetsKeys(bodyValue);
             let lines = bodyValue.split('<br/>');
             const filteredLines = lines.filter(line => !line.includes('Merge branch')); // "Merge branch"를 포함하지 않는 라인만 필터링
             temp.body.storage.value = filteredLines.join('<br/>');
@@ -53,6 +55,10 @@ function callConfluencePage(){
             callConfluenceComment();
             result = "SUCCESS";
         }
+        reqPageKeys.forEach(item => {
+            _cflc.updateRequestPage({..._config, pageId:item});
+        });
+    
     }catch(error){
         console.log(JSON.stringify(error));
         console.error('API 호출 또는 JSON 파싱 오류:', error);
@@ -84,7 +90,7 @@ function initConfig(){
     // 사용자 이름과 API 토큰 결합
     let tmep = _util.getConfig("hlngs.json");
     _config = _util.marge(_config, tmep);
-
+    console.log(JSON.stringify(_config));
     let credentials = `${_config.USERNAME}:${_config.API_TOKEN}`;
     if(process.argv.length > 4){
         _config.API_TOKEN = process.argv[2];

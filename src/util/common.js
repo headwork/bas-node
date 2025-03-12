@@ -3,6 +3,108 @@ const _deasync = require('deasync');
 const _lodash = require('lodash');
 const fs = require('fs');
 
+let utilLogger = (()=>{
+    const _logLevel = {
+        DEBUG: 0,
+        INFO: 1,
+        NOTICE: 2,
+        WARNING: 3,
+        ERROR: 4,
+        DISABLE: 99
+    };
+    const _checkLogLevel = Object.keys(_logLevel);
+    let _level = _logLevel.DEBUG;
+    function logPring(tag, msg, e){
+        if(typeof(msg)){
+            msg = JSON.stringify(msg, null, 2);
+        }
+        console.log(`[${tag} ${(new Date()).toISOString().replace(/T/, " ").substring(0, 19)}] : ` + (msg + logStack(e.stack)));
+    }
+    let _that ={
+        ..._logLevel,
+        get isDebug() { return _level <= _logLevel.DEBUG;},
+        get isInfo() { return _level <= _logLevel.INFO;},
+        get isError() { return _level <= _logLevel.ERROR;},
+        log : function (msg){
+            let e = new Error("");
+            console.log(msg + logStack(e.stack));
+        },
+        debug : function (msg){
+            if(_level > _logLevel.DEBUG) return;
+            logPring(_checkLogLevel[_logLevel.DEBUG], msg, new Error(""));
+        },
+        info : function (msg){
+            if(_level > _logLevel.INFO) return;
+            logPring(_checkLogLevel[_logLevel.INFO], msg, new Error(""));
+        },
+        error : function (e){
+            if(_level > _logLevel.ERROR) return;
+            if(typeof(e) == "string"){
+                console.error(`[ERROR ${(new Date()).toISOString().replace(/T/, " ").substring(0, 19)}] : ` + (e + logStack((new Error("")).stack)));
+            }else if(e.stack){
+                console.error(`[ERROR ${(new Date()).toISOString().replace(/T/, " ").substring(0, 19)}] : ` + (e.stack));
+            }else{
+                console.error(`[ERROR ${(new Date()).toISOString().replace(/T/, " ").substring(0, 19)}] : ` + (JSON.stringify(e, null, 2)));
+            }
+        }
+    };
+
+    function logStack(stack){
+        if (!stack) return [];
+
+        const lines = stack.split('\n'); // 첫 줄은 오류 메시지이므로 제외
+        let msg = "";
+        let cnt = 0;
+        lines.slice(2).some(line => {
+            if(line.indexOf("anonymous") > -1 || line.indexOf("Module._compile") > -1) return true;
+            const match = line.match(/at\s+(.+?)\s+\((.+?):(\d+):(\d+)\)/);
+            if (match) {
+                msg += "\n" + line; ++cnt;
+            }
+            return cnt>2;
+        });
+
+        return msg;
+    }
+
+    function parseStack(stack){
+        if (!stack) return [];
+
+        const lines = stack.split('\n'); // 첫 줄은 오류 메시지이므로 제외
+        const stackFrames = lines.slice(1).map(line => {
+            const match = line.match(/at\s+(.+?)\s+\((.+?):(\d+):(\d+)\)/);
+            if (match) {
+                return {
+                    functionName: match[1],
+                    filePath: match[2],
+                    lineNumber: parseInt(match[3]),
+                    columnNumber: parseInt(match[4])
+                };
+            }
+            return null;
+        }).filter(frame => frame); // null 제거
+
+        return stackFrames;
+    }
+
+    Object.defineProperty(_that, "level", {
+        get() { 
+            return _checkLogLevel[_level];
+        },
+        set(level) {
+            level = level.toUpperCase();
+            if(typeof(level) == number){
+                _level = _checkLogLevel[level] || _level;
+            }else if(_checkLogLevel.some(item=>item==level)){
+                _level = _logLevel[level];
+            }else{
+                console.error("utilLogger 설정오류 level = " + level);
+            }
+        }
+    });
+    return _that;
+})();
+
 function marge(){
     return _lodash.merge.apply(null, arguments);
 }
@@ -165,111 +267,9 @@ let utilDate = (()=>{
     return _that;
 })();
 
-let utilLogger = (()=>{
-    const _logLevel = {
-        DEBUG: 0,
-        INFO: 1,
-        NOTICE: 2,
-        WARNING: 3,
-        ERROR: 4,
-        DISABLE: 99
-    };
-    const _checkLogLevel = Object.keys(_logLevel);
-    let _level = _logLevel.DEBUG;
-    function logPring(tag, msg, e){
-        if(typeof(msg)){
-            msg = JSON.stringify(msg, null, 2);
-        }
-        console.log(`[${tag} ${(new Date()).toISOString().replace(/T/, " ").substring(0, 19)}] : ` + (msg + logStack(e.stack)));
-    }
-    let _that ={
-        ..._logLevel,
-        get isDebug() { return _level <= _logLevel.DEBUG;},
-        get isInfo() { return _level <= _logLevel.INFO;},
-        get isError() { return _level <= _logLevel.ERROR;},
-        log : function (msg){
-            let e = new Error("");
-            console.log(msg + logStack(e.stack));
-        },
-        debug : function (msg){
-            if(_level > _logLevel.DEBUG) return;
-            logPring(_checkLogLevel[_logLevel.DEBUG], msg, new Error(""));
-        },
-        info : function (msg){
-            if(_level > _logLevel.INFO) return;
-            logPring(_checkLogLevel[_logLevel.INFO], msg, new Error(""));
-        },
-        error : function (e){
-            if(_level > _logLevel.ERROR) return;
-            if(typeof(e) == "string"){
-                console.error(`[ERROR ${(new Date()).toISOString().replace(/T/, " ").substring(0, 19)}] : ` + (e + logStack((new Error("")).stack)));
-            }else if(e.stack){
-                console.error(`[ERROR ${(new Date()).toISOString().replace(/T/, " ").substring(0, 19)}] : ` + (e.stack));
-            }else{
-                console.error(`[ERROR ${(new Date()).toISOString().replace(/T/, " ").substring(0, 19)}] : ` + (JSON.stringify(e, null, 2)));
-            }
-        }
-    };
-
-    function logStack(stack){
-        if (!stack) return [];
-
-        const lines = stack.split('\n'); // 첫 줄은 오류 메시지이므로 제외
-        let msg = "";
-        let cnt = 0;
-        lines.slice(2).some(line => {
-            if(line.indexOf("anonymous") > -1 || line.indexOf("Module._compile") > -1) return true;
-            const match = line.match(/at\s+(.+?)\s+\((.+?):(\d+):(\d+)\)/);
-            if (match) {
-                msg += "\n" + line; ++cnt;
-            }
-            return cnt>2;
-        });
-
-        return msg;
-    }
-
-    function parseStack(stack){
-        if (!stack) return [];
-
-        const lines = stack.split('\n'); // 첫 줄은 오류 메시지이므로 제외
-        const stackFrames = lines.slice(1).map(line => {
-            const match = line.match(/at\s+(.+?)\s+\((.+?):(\d+):(\d+)\)/);
-            if (match) {
-                return {
-                    functionName: match[1],
-                    filePath: match[2],
-                    lineNumber: parseInt(match[3]),
-                    columnNumber: parseInt(match[4])
-                };
-            }
-            return null;
-        }).filter(frame => frame); // null 제거
-
-        return stackFrames;
-    }
-
-    Object.defineProperty(_that, "level", {
-        get() { 
-            return _checkLogLevel[_level];
-        },
-        set(level) {
-            level = level.toUpperCase();
-            if(typeof(level) == number){
-                _level = _checkLogLevel[level] || _level;
-            }else if(_checkLogLevel.some(item=>item==level)){
-                _level = _logLevel[level];
-            }else{
-                console.error("utilLogger 설정오류 level = " + level);
-            }
-        }
-    });
-    return _that;
-})();
-
 module.exports = {
+    utilLogger,
     callRequest, marge, getConfig,
     utilFile,
-    utilDate,
-    utilLogger
+    utilDate
 }

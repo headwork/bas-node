@@ -17,3 +17,9 @@
 
 # 
 npm install webpack webpack-cli --save-dev
+
+
+프로젝트 배포
+실행시 배포경로 이동
+패키지 설치
+npm install --production

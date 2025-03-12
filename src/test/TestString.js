@@ -1,4 +1,5 @@
 const _util = require('../util/common');
+const _cflc = require('../util/confluence');
 const _logger = _util.utilLogger;
 
 let map = {"a":1, b:2, c:false};
@@ -8,7 +9,7 @@ let map = {"a":1, b:2, c:false};
 
 // testDate();
 
-testError1();
+// testError1();
 function testError1(){
     // _logger.debug("test");
     testError2();
@@ -42,4 +43,28 @@ function testRegex(completionDateText){
     });
 
     console.log(htmlString);
+}
+
+testRegex2();
+function testRegex2(){
+    let htmlString = `
+    테스트1
+    {key:97714178}
+    {key:97714175}
+    {key:97714178}
+    테스트2
+    `
+    const regex = new RegExp(`{key:(.*?)}`, "g");
+    let pageKey = [];
+    // const matches = htmlString.match(regex);
+    const matches = [...htmlString.matchAll(regex)];
+    // if(matches.)
+    // const uniqueKeys = [...new Set(matches)];
+    // matches.forEach((match, index) => {
+    //     if(!pageKey.includes(match[1])) pageKey.push(match[1]);
+    //     console.log(`인덱스 ${index}: ${match} `);
+    // });
+    pageKey = _cflc.findContnetsKeys(htmlString);
+
+    console.log(pageKey);
 }

@@ -11,12 +11,25 @@ let _config = {
     , TAG_DEPLOY : "TEST"
 }
 initConfig();
+if(!_config.isRun) return;
 // testCleanComment(); /* 댓글 삭제 */
 updateRequestPage();
 
 function updateRequestPage(){
+    _config.TAG_DEPLOY = "PROD";
     _config.TAG_DEPLOY = "QA";
-    _cflc.updateRequestPage({..._config, pageId:"96305153"});
+    let pageKey = null;
+    // _cflc.updateRequestPage({..._config, pageId:"96993281"});
+    // _cflc.updateRequestPage({..._config, pageId:"97812481"});
+    // _cflc.updateRequestPage({..._config, pageId:"97615917"});
+    pageKey = [""
+        , "97714178"    //고정
+        // , "96993281"    //재직
+    ];
+    pageKey.forEach(element => {
+        if(element == "") return;
+        _cflc.updateRequestPage({..._config, pageId:element});
+    });  
 }
 
 /* 댓글 */
@@ -52,6 +65,7 @@ function initConfig(){
     _config = _util.marge(_config, tmep);
 
     let credentials = `${_config.USERNAME}:${_config.API_TOKEN}`;
+    _config.isRun = false;
     if(process.argv.length > 4){
         _config.API_TOKEN = process.argv[2];
         _config.ROOT_PATH = process.argv[3];
@@ -80,6 +94,7 @@ function initConfig(){
 
         // Base64 인코딩
         _config.credentials = Buffer.from(credentials).toString('base64');
+        _config.isRun = true;
     }else{
         console.log("설정오류");
         return "FAIL";
