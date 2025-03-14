@@ -11,9 +11,19 @@
 >npm install --save lodash
 >npm install --save deasync
 >npm install --save request-promise-native
+>npm install --save crypto
 >npm uninstall stack-trace
+>
+># 개발
+>npm install webpack webpack-cli --save-dev
 >```
 
+# 배포
+```
+# 번들처리시 deasync 제외됨
+npm install deasync
+
+```
 
 # 
 npm install webpack webpack-cli --save-dev
