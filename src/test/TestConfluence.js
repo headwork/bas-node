@@ -18,6 +18,9 @@ updateRequestPage();
 function updateRequestPage(){
     _config.TAG_DEPLOY = "PROD";
     _config.TAG_DEPLOY = "QA";
+
+
+
     let pageKey = null;
     // _cflc.updateRequestPage({..._config, pageId:"96993281"});
     // _cflc.updateRequestPage({..._config, pageId:"97812481"});
@@ -26,6 +29,10 @@ function updateRequestPage(){
         , "97714178"    //고정
         // , "96993281"    //재직
     ];
+    str = "{key:123}, {key:222}, {key:333}"
+    pageKey = _cflc.findContnetsKeys(str);
+    console.log(pageKey);
+    return ;
     pageKey.forEach(element => {
         if(element == "") return;
         _cflc.updateRequestPage({..._config, pageId:element});
