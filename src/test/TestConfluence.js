@@ -26,13 +26,14 @@ function updateRequestPage(){
     // _cflc.updateRequestPage({..._config, pageId:"97812481"});
     // _cflc.updateRequestPage({..._config, pageId:"97615917"});
     pageKey = [""
-        , "97714178"    //고정
+        // , "97714178"    //고정
+        , "103251969"    //고정
         // , "96993281"    //재직
     ];
     str = "{key:123}, {key:222}, {key:333}"
-    pageKey = _cflc.findContnetsKeys(str);
-    console.log(pageKey);
-    return ;
+    // pageKey = _cflc.findContnetsKeys(str);
+    // console.log(pageKey);
+    // return ;
     pageKey.forEach(element => {
         if(element == "") return;
         _cflc.updateRequestPage({..._config, pageId:element});

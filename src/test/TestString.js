@@ -28,6 +28,7 @@ function testDate(){
     console.log("temp = " + temp);
 }
 
+// testRegex("진행률");
 function testRegex(completionDateText){
     let htmlString = `
     <th><p><strong>진행률</strong></p></th><td><p>50%</p></td>
@@ -45,7 +46,40 @@ function testRegex(completionDateText){
     console.log(htmlString);
 }
 
-testRegex2();
+testRegexFind("진행률");
+function testRegexFind(completionDateText){
+    let htmlString = `
+    <th><p><strong>진행률</strong></p></th><td><p>50%</p></td>
+    <th><p><strong>예정일</strong></p></th><td><p>2025-12-31</p></td>
+    <th><p><strong>완료일</strong></p></th><td><p /></td>
+    <th><p><strong>완료일1</strong></p></th><td><p /></td>
+    <th><p><strong>완료일2</strong></p></th><td><p /></td>
+    `
+    let toVal = "90%";
+    let regex = new RegExp(`(<th><p><strong>${completionDateText}<\/strong><\/p><\/th><td>)(<p>.+<\/p>|<p \/>)(<\/td>)`);
+    const match = htmlString.match(regex);
+    if (match) {
+        if(match[2] == "<p />"){
+            // console.log(`match[1] = ${match[1]}, match[2]=${match[2]}`);
+            let temp = htmlString.replace(regex, `$1<p>${toVal}</p>$3`);
+            console.log(temp);
+        }else{
+            let matchPer = match[2].match(/(\d+%)/);
+            if(matchPer){
+                console.log(`match[1] = ${matchPer[1]}`);
+
+                let temp = htmlString.replace(regex, `$1<p>${toVal}</p>$3`);
+                console.log(temp);
+            }
+        }
+    }else{
+        const regex = /(<th><p><strong>진행률<\/strong><\/p><\/th><td><p>)(\d+%)(<\/p><\/td>)/;
+        const match = htmlString.match(progressRegex);
+    }
+    console.log(match);
+}
+
+// testRegex2();
 function testRegex2(){
     let htmlString = `
     테스트1

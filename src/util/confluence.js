@@ -140,14 +140,22 @@ let utilConfluence = (()=>{
 
     _that.changeProgress = function (pageData, toVal){
         let content = pageData.body.storage.value;
-        let version = pageData.version.number;
-      
+
         // 진행률이 90%가 아닐 경우 업데이트
-        const regex = /(<th><p><strong>진행률<\/strong><\/p><\/th><td><p>)(\d+%)(<\/p><\/td>)/;
+        const regex = /(<th><p><strong>진행률<\/strong><\/p><\/th><td>)(<p>\d+%<\/p>|<p \/>)(<\/td>)/;
+        // const regex = /(<th><p><strong>진행률<\/strong><\/p><\/th><td><p>)(\d+%)(<\/p><\/td>)/;
         const match = content.match(regex);
-        if (match && match[2] !== toVal) {
-            pageData.body.storage.value = content.replace(regex, `$1${toVal}$3`);
-            return true;
+        if (match){
+            if (match[2] == "<p />") {
+                pageData.body.storage.value = content.replace(regex, `$1<p>${toVal}</p>$3`);
+                return true;
+            }
+            const matchPer = match[2].match(/(\d+%)/);
+
+            if (matchPer && matchPer[1] !== toVal){
+                pageData.body.storage.value = content.replace(regex, `$1<p>${toVal}</p>$3`);
+                return true;
+            }
         }
     
         return false;
