@@ -93,28 +93,30 @@ let utilConfluence = (()=>{
             result = _util.callRequest(_that.defOptions({...param, method:"GET", async:false}));
             result = JSON.parse(result);
             if(global.isDebug) console.log("title = " + result.title);
-            if(!_that.changeProgress(result, changeText)) return;
             if(param.TAG_DEPLOY == "PROD") _that.changeDate(result, "완료일");
 
-            param.URL_ADD = param.pageId;
-            param.data = _that.newPageBody({
-                pageId: result.id
-                , title : result.title
-                , value : result.body.storage.value
-                , version : result.version.number
-            });
-            result = _util.callRequest(_that.defOptions({...param, method:"PUT"})
-                , (res)=>{}
-                , (res)=>{
-                    console.error(`param.data = ${JSON.stringify(param.data)}`);
-                    console.error(JSON.stringify(res));
-                    console.error(`page[${param.pageId}] update error[${res.response.statusCode}]`);
-            });
+            let isChange = _that.changeProgress(result, changeText);
+            if(isChange){
+                param.URL_ADD = param.pageId;
+                param.data = _that.newPageBody({
+                    pageId: result.id
+                    , title : result.title
+                    , value : result.body.storage.value
+                    , version : result.version.number
+                });
+                result = _util.callRequest(_that.defOptions({...param, method:"PUT"})
+                    , (res)=>{}
+                    , (res)=>{
+                        console.error(`param.data = ${JSON.stringify(param.data)}`);
+                        console.error(JSON.stringify(res));
+                        console.error(`page[${param.pageId}] update error[${res.response.statusCode}]`);
+                });
+            }
 
             if(param.TAG_DEPLOY == "QA"){
                 _that.updateRequestPageComment({...param});
             }
-
+            if(!isChange) return;
             /* 라벨변경 */
             if(param.TAG_DEPLOY != "PROD") return;
             if(global.isDebug) console.log("label 추가 ");

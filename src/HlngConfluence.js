@@ -58,14 +58,9 @@ function callDeploy(){
             temp.title = "test " + _util.utilDate.getYYYYMMDDHHMM();
         }
         
-        // data = JSON.stringify(temp);
-        // console.log(JSON.stringify(temp));
         let param = {..._config, data:temp};
         let res = _cflc.callRequest({...param, method:"POST", async:false, URL_ADD:""});
         console.log();
-        // console.log("res.id = " + res.id);
-        // let jsonData = JSON.parse(res);
-        // if(true) return "";
         param.pageId = res.id;
         if(param.pageId == null){
             _cflc.errorPage(param);

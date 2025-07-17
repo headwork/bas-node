@@ -25,8 +25,9 @@ npm install deasync
 
 ```
 
-# 
+# 배포명령어
 npm install webpack webpack-cli --save-dev
+npx webpack --config .\bundle_config\webpack.config.js
 
 
 프로젝트 배포
