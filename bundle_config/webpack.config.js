@@ -79,14 +79,21 @@ function getJsFiles(dir) {
 }
 
 function cleanFile(){
-    const regex = new RegExp("config|.+\.bat", "g");
     let distPath = pjtPath + "\\dist";
-    // dist 폴더 내 모든 파일 삭제 (예외 파일 제외)
+    if (!fs.existsSync(distPath)) return;
+
+    // 지우면 안 되는 것: 설정 폴더와 실행 런처.
+    //
+    // ⚠️ 예전에는 new RegExp("config|.+\.bat", "g") 를 test() 로 돌렸는데,
+    //    g 플래그가 붙은 정규식의 test() 는 lastIndex 를 전진시켜 호출마다
+    //    결과가 달라진다. 그래서 보호 대상이 순서에 따라 삭제됐다 —
+    //    실제로 dist/config 가 통째로 날아갔다. 상태 없는 판정으로 바꾼다.
+    const keep = file => file === "config" || file.toLowerCase().endsWith(".bat");
+
     fs.readdirSync(distPath).forEach(file => {
-        if (!regex.test(file)) {
-            console.log("file = " + file);
-            fs.rmSync(path.join(distPath, file), { recursive: true, force: true });
-        }
+        if (keep(file)) return;
+        console.log("clean = " + file);
+        fs.rmSync(path.join(distPath, file), { recursive: true, force: true });
     });
 }
 

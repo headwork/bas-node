@@ -23,20 +23,29 @@ const APP_FILE = 'app.json';
  * 런처가 cd 를 하거나 젠킨스가 다른 위치에서 부를 수 있기 때문이다.
  */
 function resolveConfigDir(explicit) {
+  // 번들과 소스는 __dirname 이 다르다.
+  //   번들: <bundle>/bas-deploy.js  -> __dirname = <bundle>
+  //   소스: <repo>/src/config/      -> __dirname = <repo>/src/config
+  // 양쪽을 모두 후보에 넣는다. 하나만 넣으면 다른 쪽에서 설정을 통째로 못 찾는다.
   const candidates = [
     explicit,
     process.env.BAS_CONFIG_DIR,
-    path.join(__dirname, '..', '..', 'config'),   // 번들 배치본: <bundle>/config
-    path.join(__dirname, '..', '..', 'dist', 'config'), // 소스 실행: <repo>/dist/config
+    path.join(__dirname, 'config'),                     // 번들: <bundle>/config
+    path.join(__dirname, '..', 'config'),
+    path.join(__dirname, '..', '..', 'config'),
+    path.join(__dirname, '..', '..', 'dist', 'config'), // 소스: <repo>/dist/config
     path.join(process.cwd(), 'config'),
   ].filter(Boolean);
 
+  // app.json 이 아니라 폴더 존재로 판정한다.
+  // app.json 은 git 추적 대상이 아니라 신규 클론에는 없을 수 있다 —
+  // 그것을 기준으로 삼으면 설정 폴더를 통째로 못 찾는다.
   for (const dir of candidates) {
-    if (fs.existsSync(path.join(dir, APP_FILE))) return path.resolve(dir);
+    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return path.resolve(dir);
   }
 
   throw new Error(
-    `설정 폴더를 찾지 못했습니다 (${APP_FILE} 없음). 찾아본 경로:\n  ` +
+    `설정 폴더를 찾지 못했습니다. 찾아본 경로:\n  ` +
     candidates.map(c => path.resolve(c)).join('\n  ') +
     `\n  BAS_CONFIG_DIR 환경변수나 --config-dir 로 지정할 수 있습니다.`
   );
@@ -93,20 +102,23 @@ function merge(base, over) {
  */
 function loadConfig(opts = {}) {
   const dir = resolveConfigDir(opts.configDir);
-  const app = readJson(path.join(dir, APP_FILE));
+
+  // app.json 은 있으면 공통 기본값으로 깔고, 없어도 진행한다.
+  const appFile = path.join(dir, APP_FILE);
+  const app = fs.existsSync(appFile) ? readJson(appFile) : {};
 
   const projects = Array.isArray(app.projects) ? app.projects : [];
   const project = opts.project || app.defaultProject || (projects.length === 1 ? projects[0] : null);
 
   if (!project) {
-    // 여러 개 중 하나를 임의로 고르지 않는다. 잘못 고르면 다른 시스템에 배포한다.
+    // 임의로 고르지 않는다. 잘못 고르면 다른 시스템 설정으로 배포한다.
     throw new Error(
-      projects.length === 0
-        ? `${APP_FILE} 에 projects 가 없습니다. 예) "projects": ["hlngs"]`
-        : `프로젝트를 지정해야 합니다 (--project). 등록된 프로젝트: ${projects.join(', ')}`
+      `프로젝트를 지정해야 합니다. YAML 의 project 키를 쓰십시오. 예) project: "hlngs"` +
+      (projects.length ? `\n  ${APP_FILE} 에 등록된 프로젝트: ${projects.join(', ')}` : '')
     );
   }
 
+  // app.json 에 목록이 있을 때만 소속을 검사한다. 목록이 없으면 yaml 의 선언을 믿는다.
   if (projects.length > 0 && !projects.includes(project)) {
     throw new Error(`등록되지 않은 프로젝트입니다: '${project}'. 등록된 프로젝트: ${projects.join(', ')}`);
   }
@@ -144,11 +156,23 @@ function loadConfig(opts = {}) {
  * 실행 위치에 따라 다른 자리에 상태가 쌓인다.
  */
 function resolveStatePath(config, yamlPath) {
+  const base = path.basename(yamlPath).replace(/\.(ya?ml)$/i, '') + '.json';
   const configured = config.get('deploy.state_path');
-  if (configured) return path.resolve(configured);
 
-  const base = path.basename(yamlPath).replace(/\.(ya?ml)$/i, '');
-  return path.join(path.resolve(config.dir, '..'), '_state', `${base}.json`);
+  if (!configured) {
+    return path.join(path.resolve(config.dir, '..'), '_state', base);
+  }
+
+  // 설정값은 파일로도 폴더로도 쓴다. 폴더면 yaml 이름을 붙인다.
+  // 폴더를 파일 경로로 오인하면 쓰기 시점에 EISDIR 로 죽는데, 그때는
+  // 이미 배포가 진행된 뒤라 늦다. 여기서 가른다.
+  const resolved = path.resolve(configured);
+  const looksLikeDir =
+    /[\\/]$/.test(configured) ||
+    path.extname(resolved) === '' ||
+    (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory());
+
+  return looksLikeDir ? path.join(resolved, base) : resolved;
 }
 
 module.exports = { loadConfig, resolveConfigDir, resolveStatePath, expandEnv, merge };

@@ -163,24 +163,128 @@ class PipelineEngine {
     console.log(`[Pipeline] Merged Context Variables:`, maskVariables(this.context.variables, secretKeys));
 
     const basePath = path.dirname(yamlPath);
+    const allStages = Array.isArray(doc.stages) ? doc.stages : [];
+
+    // 그룹 선택 (--only). 젠킨스가 단계별로 나눠 부를 때 쓴다.
+    const plan = this.selectStages(allStages, options.only);
+
+    if (options.only) {
+      console.log(`[Pipeline] 그룹 '${options.only}' 만 실행합니다 (${plan.selected.length}/${allStages.length}단계)`);
+      if (plan.ungrouped.length > 0) {
+        // group 이 없는 스테이지는 --only 로는 영영 실행되지 않는다. 조용히 빠지면 안 된다.
+        console.log(`[Pipeline] 경고: group 이 없어 실행되지 않는 스테이지 - ${plan.ungrouped.join(', ')}`);
+      }
+    }
 
     if (options.dryRun) {
-      this.printPlan(doc, secretKeys);
+      this.printPlan(doc, secretKeys, plan);
       return;
     }
 
-    try {
-      if (doc.stages && Array.isArray(doc.stages)) {
-        for (const stage of doc.stages) {
-          await this.executeStage(stage, basePath);
-        }
+    const state = options.state || null;
+    const key = options.deployKey || null;
+
+    // 이전 단계의 판정을 이어받는다. 없으면 changed_static_only 가 undefined 가 되어
+    // `unless:` 가 통과하고 전체 빌드가 도는데, 에러가 나지 않아 아무도 모른다.
+    if (state && key) {
+      const prior = state.find(key);
+
+      if (options.only && plan.firstGroup && options.only !== plan.firstGroup && !prior) {
+        throw new Error(
+          `이어받을 상태가 없습니다 (key=${key}, group=${options.only}).\n` +
+          `  첫 그룹은 '${plan.firstGroup}' 입니다. 앞 단계가 실행되지 않았거나 --deploy-key 가 다릅니다.`
+        );
       }
+
+      const { run, resumed } = state.begin({
+        key, yamlPath, environment: this.context.environment, project: doc.project
+      });
+      if (resumed && run.variables) {
+        Object.assign(this.context.variables, run.variables);
+        const names = Object.keys(run.variables);
+        if (names.length) console.log(`[state] 이전 단계에서 이월: ${names.join(', ')}`);
+      }
+    }
+
+    const groupLabel = options.only || '(전체)';
+    const startedAt = Date.now();
+
+    try {
+      for (const stage of plan.selected) {
+        if (state && key && state.isCancelRequested(key)) {
+          // 스테이지 경계에서만 멈춘다. 진행 중인 압축을 중간에 끊지는 못한다.
+          console.log(`\n[Pipeline] 취소 요청이 확인되어 중단합니다 (key=${key})`);
+          if (state) {
+            state.recordGroup(key, groupLabel, {
+              status: 'cancelled', elapsedMs: Date.now() - startedAt, variables: this.context.variables
+            });
+            state.finish(key, 'cancelled');
+          }
+          return { cancelled: true };
+        }
+        await this.executeStage(stage, basePath);
+      }
+
+      if (state && key) {
+        state.recordGroup(key, groupLabel, {
+          status: 'success',
+          elapsedMs: Date.now() - startedAt,
+          variables: this.context.variables,
+          changedFiles: this.context.changedFiles
+        });
+        // 마지막 그룹까지 끝났을 때만 실행 자체를 종료 처리한다.
+        if (!options.only || options.only === plan.lastGroup) state.finish(key, 'success');
+      }
+
       console.log(`[Pipeline] Pipeline finished successfully.`);
+      return { cancelled: false };
     } catch (err) {
       console.error(`\n[Pipeline Error] Pipeline failed: ${err.message}`);
+      if (state && key) {
+        state.recordGroup(key, groupLabel, {
+          status: 'failed', error: err.message,
+          elapsedMs: Date.now() - startedAt, variables: this.context.variables
+        });
+        state.finish(key, 'failed', err.message);
+      }
       await this.executeRollback(doc, basePath);
       throw err;
     }
+  }
+
+  /**
+   * 스테이지를 그룹으로 가른다.
+   *   - only 가 없으면 전부 실행한다 (기존 동작 그대로)
+   *   - only 가 있으면 그 group 만 골라 YAML 순서대로 실행한다
+   */
+  selectStages(stages, only) {
+    const groupOf = s => {
+      const name = Object.keys(s)[0];
+      const cfg = s[name];
+      return (cfg && typeof cfg === 'object' && cfg.group) ? String(cfg.group) : null;
+    };
+
+    const groups = [];
+    const ungrouped = [];
+    for (const s of stages) {
+      const g = groupOf(s);
+      if (g) { if (!groups.includes(g)) groups.push(g); }
+      else ungrouped.push(Object.keys(s)[0]);
+    }
+
+    const firstGroup = groups[0] || null;
+    const lastGroup = groups[groups.length - 1] || null;
+
+    if (!only) return { selected: stages, groups, firstGroup, lastGroup, ungrouped };
+
+    if (!groups.includes(only)) {
+      // 오타를 조용히 "0단계 실행"으로 넘기면 성공으로 보인다.
+      throw new Error(
+        `'${only}' 그룹이 YAML 에 없습니다. 정의된 그룹: ${groups.length ? groups.join(', ') : '(없음)'}`
+      );
+    }
+
+    return { selected: stages.filter(s => groupOf(s) === only), groups, firstGroup, lastGroup, ungrouped };
   }
 
   /**
@@ -188,7 +292,7 @@ class PipelineEngine {
    * 사람이 눈으로 확인하는 용도이므로, 무엇이 어떤 값으로 해석됐는지와
    * 등록되지 않은 스테이지가 있는지를 드러내는 것이 목적이다.
    */
-  printPlan(doc, secretKeys) {
+  printPlan(doc, secretKeys, plan = null) {
     const line = '='.repeat(70);
     console.log(`\n${line}`);
     console.log(`  DRY RUN - 실행하지 않습니다`);
@@ -244,7 +348,15 @@ class PipelineEngine {
       });
     };
 
-    if (Array.isArray(doc.stages)) describe(doc.stages, '실행 계획');
+    if (plan && plan.groups.length > 0) {
+      console.log(`\n[그룹] ${plan.groups.join(' -> ')}`);
+      if (plan.ungrouped.length > 0) {
+        console.log(`  group 없음(--only 로는 실행되지 않음): ${plan.ungrouped.join(', ')}`);
+      }
+    }
+
+    if (plan && plan.selected) describe(plan.selected, '실행 계획');
+    else if (Array.isArray(doc.stages)) describe(doc.stages, '실행 계획');
     if (Array.isArray(doc.rollback)) describe(doc.rollback, '실패 시 롤백');
     else if (doc.rollback) console.log(`\n[실패 시 롤백] 명령형 정의 있음`);
     else console.log(`\n[실패 시 롤백] 없음 - 실패해도 되돌리지 않는다`);
@@ -295,6 +407,7 @@ class PipelineEngine {
       }
       delete stageConfig.if;
       delete stageConfig.unless;
+      delete stageConfig.group;   // 실행 선택용 메타. 스테이지 설정이 아니다.
     }
 
     console.log(`\n--- [Stage: ${stageName}] ---`);

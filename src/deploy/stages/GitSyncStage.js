@@ -100,6 +100,10 @@ class GitSyncStage extends BaseStage {
     vars.has_changes = files.length > 0;
     vars.changed_count = files.length;
 
+    // 목록 자체는 변수가 아니라 컨텍스트에 둔다. 상태 파일이 이걸 받아
+    // 다음 단계·다음 실행으로 넘긴다(공지·재공지용). 변수에 넣으면 치환·마스킹 대상이 된다.
+    this.engine.context.changedFiles = files;
+
     console.log(`[GitSyncStage] ${before.slice(0, 8)} -> ${after.slice(0, 8)} : 변경 ${files.length}건`);
 
     if (!staticPaths || staticPaths.length === 0) {
