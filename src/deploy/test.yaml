@@ -1,0 +1,13 @@
+name: "Test Pipeline"
+environment: "dev"
+variables:
+  TAG_DEPLOY: "v1.0.0"
+  SECRET_KEY: "${env.MY_SECRET}"
+backup:
+  keep_recent_days: 7
+stages:
+  - echo_env: "echo Environment is ${environment} and TAG is ${TAG_DEPLOY}"
+  - echo_secret: "echo Secret is ${SECRET_KEY}"
+  - mock_deploy:
+      script_dir: "."
+      restart_cmd: "echo Restarting with tag ${TAG_DEPLOY}"

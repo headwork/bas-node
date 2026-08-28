@@ -1,0 +1,35 @@
+# deploy_shore.yaml
+name: "Deploy MFM.SHORE_QA"
+environment: "qa"
+deploy_path: "D:/Deploy"
+# 젠킨스나 .env에 등록된 GIT_API_KEY를 치환하여 사용합니다.
+git_url: "http://sghwang:${env.GIT_API_KEY}@112.217.163.10:16784/WeSys.git"
+
+target:
+  qa:
+    branch: "deploy/qa"
+    deploy_path: "${deploy_path}/MFM.SHORE_QA"
+    build_path: "${deploy_path}/build/MFM.SHORE_QA"
+    confluence: true
+  prod:
+    branch: "master"
+    deploy_path: "${deploy_path}/MFM.SHORE"
+    build_path: "${deploy_path}/build/MFM.SHORE"
+    confluence: true
+
+# 백업 보관 정책 (#P001-OQ2). local_deploy 성공 직후 자동 적용된다.
+backup:
+  keep_recent_days: 7      # 최근 7일치 백업은 전부 보관
+  keep_monthly_months: 2   # 1개월 전 · 2개월 전 각각 마지막 1개 보관
+  dry_run: false           # true 로 두면 삭제 대상만 출력하고 지우지 않는다
+
+stages:
+  - git_sync: {}       # target 설정값을 읽어 자동 git 동기화
+  - c#_build: {}       # target 설정값을 읽어 자동 빌드
+  - local_deploy: {}   # IIS 정지 -> 폴더 백업/스왑 -> IIS 시작 -> 백업 정리 (내부 자동화)
+  - confluence: {}     # confluence: true 인 경우만 동작
+
+# 파이프라인이 실패하면 실행된다 (#P001-REQ5).
+# 실패한 배포본은 <deploy_path>_failed_<timestamp> 로 남으므로 확인 후 직접 정리해야 한다.
+rollback:
+  - local_rollback: {} # IIS 정지 -> 실패본 격리 -> 최신 백업 복구 -> IIS 시작

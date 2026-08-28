@@ -97,7 +97,11 @@ function makerHlngOptions(){
     let files = getJsFiles("./src/util");
     return {
         entry: {
+            "bas-index": './src/index.js',
             "bas-HlngConfluence":'./src/HlngConfluence.js',
+            // 배포 파이프라인 CLI. 스테이지를 전부 정적 require 하므로 그대로 번들된다.
+            // 실행: node bas-deploy.js --yaml=<경로> [--dry-run]
+            "bas-deploy": './src/deploy/deploy-cli.js',
             "bas-Util": getJsFiles('.\\src\\util'),
             // "bas-Util": files,
             // library: ["axios"]

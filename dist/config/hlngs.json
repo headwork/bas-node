@@ -1,10 +1,14 @@
 {
-    "YOUR_DOMAIN" : "https://hlngs2024b.atlassian.net"
+    "YOUR_DOMAIN" : "https://wesys.atlassian.net"
     , "SPACE_KEY" : "HLNGSWESYS"
-    , "USERNAME" : "hlngs.bas@gmail.com"
+    , "USERNAME" : "it.sk.hwang@gmail.com"
     , "PARENT_PAGE_ID" : {
-        "QA_PAGE_ID" : "94208001"  
-      , "PROD_PAGE_ID" : "87621709"
+        "QA_PAGE_ID" : "557990"
+      , "PROD_PAGE_ID" : "557719"
+    }
+
+    , "deploy" : {
+        "state_path" : null
+      , "state_keep" : 10
     }
 }
-

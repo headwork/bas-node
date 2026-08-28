@@ -2,7 +2,7 @@ const _util = require('../util/common');
 const _cflc = require('../util/confluence');
 
 let _config = {
-    API_TOKEN : ""
+    API_TOKEN : "ATATT3xFfGF0GpiPru6LSKlb-gjhHbxcevoLR-YY-KCbDo5yOj8XyNpPsQM1a6ncecbu5GoYb6prg_AkNe0TFewT1avUzfsALGyNaO1BKQxuCCUoRHeZEo4G0Gs6dpqlU85vfUAvjFGTWoCx1-jg1FX8nUuxOo6tGsMTUf92YDtIRbBIRX9cjSI=CF26BF25"
     , URL_API : "/wiki/rest/api/content/"
     , credentials : null
     , ROOT_PATH : null
@@ -17,7 +17,7 @@ updateRequestPage();
 
 function updateRequestPage(){
     _config.TAG_DEPLOY = "PROD";
-    _config.TAG_DEPLOY = "QA";
+    // _config.TAG_DEPLOY = "QA";
 
 
 
@@ -27,7 +27,9 @@ function updateRequestPage(){
     // _cflc.updateRequestPage({..._config, pageId:"97615917"});
     pageKey = [""
         // , "97714178"    //고정
-        , "103251969"    //고정
+        // , "203227154"    //고정
+        // , "205422593"    //고정
+        , "2850817"    //고정
         // , "96993281"    //재직
     ];
     str = "{key:123}, {key:222}, {key:333}"

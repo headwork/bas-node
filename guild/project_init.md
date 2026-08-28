@@ -21,6 +21,7 @@
 # 배포
 ```
 # 번들처리시 deasync 제외됨
+
 npm install deasync
 
 ```

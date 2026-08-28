@@ -1,5 +1,7 @@
 {
     "isDebug": false
     , "API_KEY": "12341234"
-}
 
+    , "projects": ["hlngs"]
+    , "defaultProject": "hlngs"
+}
