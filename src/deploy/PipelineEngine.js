@@ -15,10 +15,12 @@ const { collectSecretKeys, maskVariables, maskUrlCredentials } = require('./mask
 
 // Macro Stages
 const GitSyncStage = require('./stages/GitSyncStage');
-const CSharpBuildStage = require('./stages/CSharpBuildStage');
+const BuildStage = require('./stages/BuildStage');
 const LocalDeployMacroStage = require('./stages/LocalDeployMacroStage');
 const LocalRollbackMacroStage = require('./stages/LocalRollbackMacroStage');
 const OtherServerStage = require('./stages/OtherServerStage');
+const RemoteDeployMacroStage = require('./stages/RemoteDeployMacroStage');
+const RemoteRollbackMacroStage = require('./stages/RemoteRollbackMacroStage');
 const ConfluenceStage = require('./stages/ConfluenceStage');
 
 class PipelineEngine {
@@ -26,15 +28,20 @@ class PipelineEngine {
     this.initialParams = initialParams;
     this.context = {
       variables: {},
-      environment: initialParams.environment || 'dev',
+      // 기본 환경을 정하지 않는다. 'dev' 같은 이름을 코드가 들고 있으면
+      // yaml 이 환경을 빠뜨렸을 때 **에러 없이** 그 환경으로 배포된다.
+      environment: initialParams.environment || null,
       backup: {}, // YAML 루트의 backup: 블록 (백업 보관 정책)
-      preserve: [] // YAML 루트의 preserve: 블록 (운영 중 생성 항목 보존)
+      preserve: [], // YAML 루트의 preserve: 블록 (운영 중 생성 항목 보존)
+      preserveConfig: [], // YAML 루트의 preserve_config: 블록 (서버 설정 보전)
+      exclude: [], // YAML 루트의 exclude: 블록 (빌드 산출물에서 제외)
+      // 라이브 폴더를 실제로 치웠는가. 이게 false 면 롤백하지 않는다 — 되돌릴 것이 없다.
+      rollbackArmed: false
     };
     
     // 레지스트리에 Stage 핸들러 매핑 (확장성)
     this.stageHandlers = {
       'sync': new CommandStage(this),
-      'build': new CommandStage(this),
       'upload': new CommandStage(this),
       'chain_call': new ChainStage(this),
       'extract': new ExtractStage(this),
@@ -46,10 +53,14 @@ class PipelineEngine {
       'archive': new ArchiveStage(this),
       // Macros
       'git_sync': new GitSyncStage(this),
-      'c#_build': new CSharpBuildStage(this),
+      // 언어를 이름에 박지 않는다. 무엇으로 짓는지는 build_cmd 가 정한다 —
+      // java·python 이 들어와도 스테이지 이름은 그대로다.
+      'build': new BuildStage(this),
       'local_deploy': new LocalDeployMacroStage(this),
       'local_rollback': new LocalRollbackMacroStage(this),
       'other_server': new OtherServerStage(this),
+      'remote_deploy': new RemoteDeployMacroStage(this),
+      'remote_rollback': new RemoteRollbackMacroStage(this),
       'confluence': new ConfluenceStage(this)
     };
   }
@@ -97,13 +108,247 @@ class PipelineEngine {
     return obj;
   }
 
+  /**
+   * target 이 가리키는 서버 블록(build_server · deploy_server)을 풀어 변수로 만든다.
+   *
+   * 참조는 두 가지로 쓸 수 있다.
+   *
+   *   build_server: *local_server   YAML 앵커. **없는 이름이면 파서가 죽인다**
+   *   build_server: "local"         루트 카탈로그에서 이름으로 찾는다
+   *
+   * 앵커 쪽이 안전하다 — 오타가 조용히 빈 값으로 넘어가지 않고 파싱 단계에서 걸린다.
+   * 이름 방식은 여기서 직접 막는다. 못 찾은 채 진행하면 source_path 가 비고,
+   * GitSyncStage 가 산출물 폴더를 소스로 착각한다.
+   *
+   * ⚠️ 별칭(`*name`)은 복사가 아니라 **같은 객체**다 (js-yaml 실측).
+   *    interpolateObject 가 새 객체를 만들어 돌려주므로 원본이 오염되지 않는다.
+   *    그 성질에 기대고 있으니 여기에 제자리 수정을 넣지 말 것.
+   */
+  resolveServer(doc, section, targetDef, scope) {
+    const ref = targetDef[section];
+    if (ref === undefined || ref === null) return {};
+
+    // 카탈로그는 `server_list` 하나다 — 서버는 서버일 뿐이고,
+    // 빌드용이냐 배포용이냐는 target 이 어느 자리에 꽂느냐로 정해진다.
+    const catalogs = [doc.server_list].filter(c => c && typeof c === 'object');
+    let def = null;
+    let name = null;
+
+    if (typeof ref === 'string') {
+      const hit = catalogs.find(c => c[ref]);
+      if (!hit) {
+        const available = catalogs.flatMap(c => Object.keys(c));
+        throw new Error(
+          `${section}: '${ref}' 를 찾을 수 없습니다 (target.${this.context.environment} 가 참조). ` +
+          `사용 가능: ${available.length ? available.join(', ') : '(카탈로그 없음)'}`
+        );
+      }
+      def = hit[ref];
+      name = ref;
+    } else if (typeof ref === 'object' && !Array.isArray(ref)) {
+      def = ref;
+      // 앵커로 받으면 이름이 없다. 별칭은 동일 참조이므로 카탈로그와 === 로 되찾는다.
+      for (const c of catalogs) {
+        name = Object.keys(c).find(k => c[k] === ref) || name;
+        if (name) break;
+      }
+    } else {
+      throw new Error(
+        `${section} 은 이름(문자열)이거나 서버 블록(객체)이어야 합니다: ${JSON.stringify(ref)}`
+      );
+    }
+
+    let flat = this.interpolateObject(this.expandMergeKeys(def), scope);
+
+    // ssh: { host, port } 처럼 묶어 적은 접속 정보를 평평하게 편다.
+    // 스테이지는 host·port 라는 이름으로 읽는다(RemoteDeployMacroStage 의 cfg('host')).
+    // 중첩인 채로 두면 값이 있는데도 못 찾아 "필요한 값이 없습니다" 로 멈춘다.
+    if (flat.ssh && typeof flat.ssh === 'object' && !Array.isArray(flat.ssh)) {
+      const { ssh, ...rest } = flat;
+      flat = { ...ssh, ...rest };   // 바깥에 직접 적은 값이 이긴다
+    }
+
+    console.log(`[Pipeline] ${section}: ${name ? `'${name}'` : '(인라인)'}`);
+    return flat;
+  }
+
+  /**
+   * `<<:` (머지키)를 손으로 펼친다.
+   *
+   * 이 파서는 머지키를 해석하지 않고 `"<<"` 를 **리터럴 키로 남긴다**(실측).
+   * 그대로 두면 `prod: { <<: *qa_server, ... }` 가 upload_path·ssh 를 못 받는데
+   * **에러가 나지 않는다** — 원격 배포가 값이 빈 채로 시작한다.
+   *
+   * YAML 스펙과 같은 뜻으로 편다 — **명시한 키가 병합된 키를 이긴다.**
+   * `<<: [*a, *b]` 형태도 받는다(앞선 것이 이긴다).
+   */
+  expandMergeKeys(obj, depth = 0) {
+    if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return obj;
+    if (depth > 10) return obj;   // 별칭이 서로를 가리켜도 여기서 멈춘다
+
+    const merged = {};
+    const raw = obj['<<'];
+    if (raw !== undefined) {
+      for (const src of (Array.isArray(raw) ? raw : [raw])) {
+        const raised = this.expandMergeKeys(src, depth + 1);
+        if (!raised || typeof raised !== 'object') continue;
+        for (const [k, v] of Object.entries(raised)) {
+          if (!(k in merged)) merged[k] = v;
+        }
+      }
+    }
+
+    const out = { ...merged };
+    for (const [k, v] of Object.entries(obj)) {
+      if (k === '<<') continue;
+      out[k] = this.expandMergeKeys(v, depth + 1);
+    }
+    return out;
+  }
+
+  /**
+   * 배포 갈래를 정하는 플래그를 확정한다.
+   *
+   * **환경 이름(dev·qa·prod)을 보지 않는다.** 코드가 이름을 알면 환경이 하나 늘 때마다
+   * 코드를 고쳐야 하고, 이름만 바꾼 target 이 조용히 다른 길로 간다.
+   * 판단 근거는 yaml 에 적힌 설정값뿐이다.
+   *
+   *   deploy_remote  생략 시 true(원격). 빠뜨린 설정이 라이브를 갈아치우는 것보다
+   *                  host 가 없어 멈추는 편이 옳다.
+   *   compress       생략 시 true(압축). 원격 배포는 zip 하나로 보내므로 끌 수 없다.
+   *
+   * 값을 `deployVars` 에 확정해 둔다. target 에 직접 적은 값은 병합 순서상 어차피
+   * 마지막에 다시 이기므로, 여기서 정하는 것은 **적지 않았을 때의 값**이다.
+   */
+  applyDeployFlags(targetDef, buildVars, deployVars) {
+    const pick = (key, fallback) => {
+      if (targetDef[key] !== undefined) return targetDef[key];
+      if (deployVars[key] !== undefined) return deployVars[key];
+      return fallback;
+    };
+
+    const deployRemote = pick('deploy_remote', true);
+    if (targetDef.deploy_remote === undefined && deployVars.deploy_remote === undefined) {
+      console.log(`[Pipeline] deploy_remote 미지정 - 기본값 true(원격 배포)로 봅니다`);
+    }
+
+    const compress = pick('compress', true);
+    if (deployRemote && compress === false) {
+      // 원격 배포는 zip 을 scp 로 올려 원격에서 푼다. 압축을 끄면 올릴 것이 없는데,
+      // remote_deploy 가 시작한 뒤에야 그것을 알게 된다. 시작 전에 멈춘다.
+      throw new Error(
+        `compress: false 는 원격 배포와 함께 쓸 수 없습니다 (target.${this.context.environment}).\n` +
+        `  원격 배포는 배포본을 zip 하나로 보냅니다. 압축을 끄려면 deploy_remote: false 여야 합니다.`
+      );
+    }
+
+    // 로컬 배포인데 빌드서버와 배포서버가 다른 블록이면 알린다.
+    // 막지는 않는다 — 원격접속 없이 이 서버의 그 경로로 배포되긴 한다.
+    // 다만 그 조합은 대개 오타이고, 경로가 실재하면 **에러 없이** 엉뚱한 폴더를 갈아치운다.
+    if (!deployRemote && buildVars.server_name && deployVars.server_name &&
+        buildVars.server_name !== deployVars.server_name) {
+      console.log(
+        `[Pipeline] 경고: 로컬 배포(deploy_remote:false)인데 빌드서버와 배포서버가 다릅니다 - ` +
+        `build='${buildVars.server_name}' deploy='${deployVars.server_name}'`
+      );
+      console.log(`[Pipeline]   이 서버의 파일시스템에 '${deployVars.web_deploy_path}' 로 배포됩니다.`);
+    }
+
+    deployVars.deploy_remote = deployRemote;
+    deployVars.compress = compress;
+  }
+
   async run(yamlPath, overrideParams = {}, options = {}) {
     console.log(`[Pipeline] Starting pipeline from ${yamlPath}...`);
     const doc = this.loadYaml(yamlPath);
+    const { secretKeys } = this.prepareContext(doc, overrideParams, options);
+    return this.#runStages(doc, yamlPath, secretKeys, options);
+  }
+
+  /**
+   * 롤백만 단독으로 실행한다 (`--rollback=N`). 젠킨스 롤백 잡이 부르는 자리다.
+   *
+   * 파이프라인 실패로 도는 롤백과 다른 점은 둘이다.
+   *   - 무장(arm) 검사를 하지 않는다. 이번 프로세스는 아무것도 배포하지 않았으니
+   *     그 값은 언제나 거짓이다. 여기서는 **백업이 실제로 있는가**로 판단한다.
+   *   - 백업을 소비하지 않는다. 복사해서 되돌리므로 몇 번이든 다시 부를 수 있다.
+   */
+  async runRollback(yamlPath, overrideParams = {}, options = {}) {
+    const doc = this.loadYaml(yamlPath);
+    this.prepareContext(doc, overrideParams, options);
+
+    if (!doc.rollback) {
+      throw new Error(`이 YAML 에는 rollback 정의가 없습니다: ${yamlPath}`);
+    }
+
+    const lastDeploy = Number(options.lastDeploy || 0);
+    if (!(lastDeploy > 0)) {
+      throw new Error(`--rollback 에는 1 이상의 번호가 필요합니다 (1 = 직전 성공 배포).`);
+    }
+    this.context.variables.last_deploy = lastDeploy;
+
+    console.log(`\n[Rollback] 강제 롤백 - 환경 ${this.context.environment}, lastDeploy=${lastDeploy}`);
+
+    if (options.dryRun) {
+      // 어느 백업으로 갈지만 보여준다. 젠킨스 잡에서 확인용으로 쓴다.
+      this.#printRollbackPlan();
+      return { dryRun: true };
+    }
+
+    const basePath = path.dirname(yamlPath);
+    const stages = Array.isArray(doc.rollback) ? doc.rollback : (doc.rollback.stages || []);
+    for (const stage of stages) {
+      await this.executeStage(stage, basePath);
+    }
+    return { rolledBack: true };
+  }
+
+  /** 강제 롤백 대상 후보를 출력한다 (--rollback --dry-run). */
+  #printRollbackPlan() {
+    const state = this.deployState;
+    if (!state) {
+      console.log(`[Rollback] 배포 이력을 읽을 수 없습니다 (설정 폴더 없음).`);
+      return;
+    }
+    const candidates = state.rollbackCandidates(this.context.environment);
+    console.log(`\n[Rollback] 되돌릴 수 있는 배포 (${candidates.length}건)`);
+    candidates.forEach((run, i) => {
+      const backup = run.variables.backup_path;
+      // 원격 배포의 백업은 저쪽 디스크에 있다. 여기서 fs 로 보면 언제나 "없음" 이라
+      // 멀쩡한 백업을 지워진 것으로 보고하게 된다. 원격은 판정하지 않는다 —
+      // 실제 존재 확인은 롤백이 ssh `if exist` 로 하고, 없으면 그때 멈춘다.
+      const remote = run.variables.deploy_remote === true;
+      const note = remote
+        ? '   (원격 - 실행 시 확인)'
+        : (fs.existsSync(backup) ? '' : '   <-- 폴더 없음(사람이 지움)');
+      console.log(`  ${i + 1}. ${path.basename(backup)}${note}`);
+      console.log(`     키 ${run.key} / 커밋 ${(run.variables.git_to || '').slice(0, 8) || '-'}` +
+        ` / ${run.finished_at || run.started_at}`);
+    });
+    if (candidates.length === 0) {
+      console.log(`  (없음) 백업이 남아 있는 성공 배포가 있어야 합니다.`);
+    }
+  }
+
+  /**
+   * YAML 을 읽어 컨텍스트 변수를 세운다. 배포와 롤백이 같은 값을 봐야 하므로 공용이다.
+   */
+  prepareContext(doc, overrideParams = {}, options = {}) {
+    // 스테이지가 이력을 읽을 수 있게 둔다 (롤백이 백업 경로를 여기서 찾는다).
+    this.deployState = options.state || this.deployState || null;
 
     // 1. 환경 결정. 외부 파라미터가 YAML 보다 우선한다 (D01.04)
     this.context.environment =
       overrideParams.environment || this.initialParams.environment || doc.environment || this.context.environment;
+
+    if (!this.context.environment) {
+      // 임의로 고르지 않는다. 어느 target 으로 배포할지가 정해지지 않은 것이다.
+      throw new Error(
+        `environment 가 정해지지 않았습니다. YAML 의 environment 키를 적거나 ` +
+        `--params={"environment":"<이름>"} 로 넘기십시오.` +
+        (doc.target ? `\n  정의된 target: ${Object.keys(doc.target).join(', ')}` : '')
+      );
+    }
 
     // 2. 루트의 단순 설정값(git_url, deploy_path, name 등)을 변수로 올린다.
     //    구조 키와 객체/배열은 변수가 아니므로 제외한다.
@@ -126,15 +371,18 @@ class PipelineEngine {
       baseVars = this.interpolateObject(baseVars);
     }
 
-    // 4. target[environment] 프로파일을 평평하게 펼쳐 덮어쓴다.
-    //    base 를 기준으로 먼저 치환해야 `deploy_path: "${deploy_path}/MFM.SHORE_QA"` 처럼
-    //    루트값을 참조하는 항목이 자기 자신을 가리키는 재귀가 되지 않는다.
+    // 4. 서버 프로파일 -> target 순으로 깐다.
+    //
+    //    축이 둘이다. **어디서 빌드하나**(git 체크아웃·산출물 루트·게시 프로파일)와
+    //    **어디에 배포하나**(라이브 폴더·IIS·원격 접속)는 서로 독립이다.
+    //    같은 빌드서버가 만든 산출물이 dev·qa·prod 로 갈려 나간다.
+    //    target 은 그 둘을 잇는 조합표다.
+    //
+    //    base 를 기준으로 먼저 치환해야 `web_deploy_path: "${deploy_root}/MFM.SHORE_QA"` 처럼
+    //    루트값을 참조하는 항목이 제대로 풀린다.
     let targetVars = {};
     const targetDef = doc.target ? doc.target[this.context.environment] : null;
-    if (targetDef && typeof targetDef === 'object') {
-      targetVars = this.interpolateObject(targetDef, baseVars);
-      console.log(`[Pipeline] Applied target profile: '${this.context.environment}'`);
-    } else if (doc.target) {
+    if (doc.target && (!targetDef || typeof targetDef !== 'object')) {
       // 프로파일이 안 잡히면 스테이지들이 빈 변수로 돌기 시작한다. 조용히 넘기지 않는다.
       throw new Error(
         `Target profile '${this.context.environment}' not found in YAML. ` +
@@ -142,10 +390,31 @@ class PipelineEngine {
       );
     }
 
+    // 축은 둘이고, 둘 다 target 이 명시한다. 엔진은 승계·추론을 하지 않는다 —
+    // 어디에 배포하는지는 `deploy_server` 가, 원격인지는 `deploy_remote` 가 정한다.
+    const buildVars = targetDef ? this.resolveServer(doc, 'build_server', targetDef, baseVars) : {};
+    const deployVars = targetDef
+      ? this.resolveServer(doc, 'deploy_server', targetDef, { ...baseVars, ...buildVars })
+      : {};
+
+    if (targetDef) {
+      this.applyDeployFlags(targetDef, buildVars, deployVars);
+      targetVars = this.interpolateObject(targetDef, { ...baseVars, ...buildVars, ...deployVars });
+      // 참조 자체는 변수가 아니다. 객체인 채로 올라가면 ${...} 치환 대상으로 보인다.
+      delete targetVars.build_server;
+      delete targetVars.deploy_server;
+      console.log(`[Pipeline] Applied target profile: '${this.context.environment}'`);
+    }
+
+    // 배포 대상 서버의 기술(host·경로·IIS)이 곧 이것이다. 스테이지가 참조한다.
+    this.context.serverInfo = Object.keys(deployVars).length > 0 ? deployVars : null;
+
     // 5. 최종 병합 — 외부 파라미터가 끝까지 최우선이다.
     this.context.variables = {
       ...baseVars,
-      ...targetVars,
+      ...buildVars,
+      ...deployVars,
+      ...targetVars,      // target 에 직접 적은 값이 서버 블록을 이긴다 (머지키 대용)
       ...overrideParams,
       environment: this.context.environment
     };
@@ -155,13 +424,21 @@ class PipelineEngine {
 
     // 백업 보관 정책도 변수 치환을 거친다 (YAML 에서 ${...} 로 쓸 수 있게)
     this.context.backup = this.interpolateObject(doc.backup || {});
-    // 운영 중 생성되어 배포 뒤에도 유지해야 하는 항목 (EDMS · Temp · 운영 web.config 등)
+    // 운영 중 생성되어 배포 뒤에도 유지해야 하는 항목 (EDMS · Temp 등)
     this.context.preserve = this.interpolateObject(doc.preserve || []);
+    // 서버 설정 파일. 위 preserve 와 시점이 다르다 — IIS 정지 전에, 라이브에서 가져온다.
+    this.context.preserveConfig = this.interpolateObject(doc.preserve_config || []);
+    // 빌드 산출물에서 지울 것. 소스의 설정 파일이 서버까지 가지 않게 한다.
+    this.context.exclude = this.interpolateObject(doc.exclude || []);
 
     // 치환이 끝난 값을 그대로 찍으면 ${env.*} 로 감춘 의미가 없다 (#P001-REQ8)
     const secretKeys = collectSecretKeys(rootVars, doc.variables, targetDef);
     console.log(`[Pipeline] Merged Context Variables:`, maskVariables(this.context.variables, secretKeys));
 
+    return { secretKeys, targetDef };
+  }
+
+  async #runStages(doc, yamlPath, secretKeys, options) {
     const basePath = path.dirname(yamlPath);
     const allStages = Array.isArray(doc.stages) ? doc.stages : [];
 
@@ -230,7 +507,9 @@ class PipelineEngine {
           status: 'success',
           elapsedMs: Date.now() - startedAt,
           variables: this.context.variables,
-          changedFiles: this.context.changedFiles
+          changedFiles: this.context.changedFiles,
+          changedCommits: this.context.changedCommits,
+          revertedCommits: this.context.revertedCommits
         });
         // 마지막 그룹까지 끝났을 때만 실행 자체를 종료 처리한다.
         if (!options.only || options.only === plan.lastGroup) state.finish(key, 'success');
@@ -435,11 +714,40 @@ class PipelineEngine {
    *   2) 원격 스크립트  rollback: { script_dir: "...", rollback_cmd: "..." }
    *   3) 단일 명령      rollback: "restore.bat"
    */
+  /**
+   * 롤백을 무장한다. **라이브 폴더를 실제로 치운 직후에만** 부른다.
+   *
+   * @param {string} reason  무엇을 되돌릴 수 있는지 (로그용)
+   */
+  armRollback(reason) {
+    if (this.context.rollbackArmed) return;
+    this.context.rollbackArmed = true;
+    this.context.variables.rollback_armed = true;   // 그룹을 나눠 실행해도 이월되도록
+    console.log(`[Rollback] 무장됨 - ${reason}`);
+  }
+
   async executeRollback(doc, basePath) {
     if (!doc.rollback) {
       console.log(`[Rollback] No rollback configuration found. Skipping rollback.`);
       return;
     }
+
+    // 배포가 라이브를 건드리기 전에 실패했으면 되돌릴 것이 없다.
+    //
+    // 예전에는 파이프라인이 어디서 죽든 롤백이 돌았다. 그래서 `c#_build` 가 솔루션을
+    // 못 찾아 죽은 것만으로 멀쩡한 라이브 폴더를 _failed_ 로 밀어내고 백업을 끌어다 썼다
+    // (2026-08-28 젠킨스 빌드 #1·#2). 백업 두 개가 그렇게 소진됐고, 그 다음 실패는
+    // 되돌릴 백업이 없어 라이브가 사라진 채로 끝났을 것이다.
+    //
+    // 무장은 `local_deploy`·`remote_deploy` 가 라이브를 백업으로 옮긴 **직후**에만 한다.
+    // 그 시점 이전의 실패는 라이브가 그대로이므로 손대지 않는 것이 옳다.
+    const armed = this.context.rollbackArmed || this.context.variables.rollback_armed === true;
+    if (!armed) {
+      console.log(`\n[Rollback] 건너뜁니다 - 배포가 라이브 폴더를 건드리기 전에 실패했습니다.`);
+      console.log(`[Rollback]   되돌릴 것이 없습니다. 백업은 그대로 보존됩니다.`);
+      return;
+    }
+
     console.log(`\n--- [Rollback Stage Initiated] ---`);
     const rollbackDef = this.interpolateObject(doc.rollback);
 

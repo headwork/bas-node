@@ -1,11 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 
-// #P001-OQ2 확정 기본값
+// 보관 기본값. 개수 기준이다 — 날짜 기준은 하루에 몇 번 배포하느냐에 따라
+// 차지하는 용량이 몇 배로 달라져서 상한이 안 잡힌다(1회 690MB).
 const DEFAULTS = {
   enabled: true,
-  keep_recent_days: 7,     // 최근 N일치는 전부 보관
-  keep_monthly_months: 2,  // 1개월 전 · 2개월 전 각각 마지막 1개 보관
+  keep_count: 3,           // 최근 성공 배포 N건의 백업만 남긴다
   dry_run: false           // true 면 삭제 대상만 출력하고 실제로 지우지 않음
 };
 
@@ -13,23 +13,44 @@ function escapeRegExp(str) {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// LocalDeployMacroStage 가 만드는 백업 명명 규칙: <basename>_backup_<epochMillis>
+/**
+ * 백업 폴더 이름 규칙: `<라이브폴더명>_backup_<YYYYMMDD_HHMMSS>`
+ *
+ * 사람이 읽을 수 있어야 한다 — 긴급 배포 때 **사람이 고르는 폴더**다.
+ * 옛 형식(epoch 밀리초)도 계속 인식한다. 안 그러면 이미 쌓인 백업이 고아가 되어
+ * 정리도 롤백도 닿지 않는다.
+ */
 function backupPatternFor(deployPath) {
   const base = path.basename(deployPath);
-  return new RegExp('^' + escapeRegExp(base) + '_backup_(\\d+)$');
+  return new RegExp('^' + escapeRegExp(base) + '_backup_(\\d{8}_\\d{6}|\\d{10,})$');
 }
 
-// 연-월을 정수 하나로 접는다. setMonth 의 말일 넘침(1/31 → 3/3) 문제를 피하기 위함.
-function monthKey(date) {
-  return date.getFullYear() * 12 + date.getMonth();
+/** 백업 폴더 이름에 쓰는 시각 문자열. 사전순 정렬이 곧 시간순이다. */
+function stampNow(date = new Date()) {
+  const p = n => String(n).padStart(2, '0');
+  return `${date.getFullYear()}${p(date.getMonth() + 1)}${p(date.getDate())}_` +
+    `${p(date.getHours())}${p(date.getMinutes())}${p(date.getSeconds())}`;
+}
+
+/** 두 형식(YYYYMMDD_HHMMSS · epoch 밀리초) 모두 정렬 가능한 수로 바꾼다. */
+function parseStamp(raw) {
+  const m = /^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})$/.exec(raw);
+  if (m) {
+    const [, y, mo, d, h, mi, s] = m;
+    return new Date(+y, +mo - 1, +d, +h, +mi, +s).getTime();
+  }
+  const epoch = Number(raw);
+  return Number.isFinite(epoch) && epoch > 0 ? epoch : null;
 }
 
 /**
- * deployPath 의 부모 디렉터리에서 해당 배포본의 백업 디렉터리만 골라 온다.
- * 최신순(내림차순) 정렬.
+ * 백업 디렉터리를 골라 온다. 최신순(내림차순) 정렬.
+ *
+ * @param deployPath 라이브 폴더 경로 (이름 규칙의 기준)
+ * @param backupRoot 백업이 모이는 폴더. 생략하면 라이브의 부모 폴더
  */
-function listBackups(deployPath) {
-  const parentDir = path.dirname(deployPath);
+function listBackups(deployPath, backupRoot) {
+  const parentDir = backupRoot || path.dirname(deployPath);
   if (!fs.existsSync(parentDir)) return [];
 
   const pattern = backupPatternFor(deployPath);
@@ -40,8 +61,8 @@ function listBackups(deployPath) {
     const matched = pattern.exec(entry.name);
     if (!matched) continue;
 
-    const timestamp = Number(matched[1]);
-    if (!Number.isFinite(timestamp) || timestamp <= 0) continue;
+    const timestamp = parseStamp(matched[1]);
+    if (timestamp === null) continue;
 
     result.push({
       name: entry.name,
@@ -53,38 +74,36 @@ function listBackups(deployPath) {
   return result.sort((a, b) => b.timestamp - a.timestamp);
 }
 
+/** 원격에서 받은 이름 목록에 같은 규칙을 적용한다. 파일시스템을 읽지 않는다. */
+function selectFromNames(names, deployPath, backupRoot, config) {
+  const pattern = backupPatternFor(deployPath);
+  const backups = [];
+
+  for (const name of names) {
+    const matched = pattern.exec(name);
+    if (!matched) continue;
+    const timestamp = parseStamp(matched[1]);
+    if (timestamp === null) continue;
+    backups.push({ name, path: `${backupRoot}\\${name}`, timestamp });
+  }
+
+  backups.sort((a, b) => b.timestamp - a.timestamp);
+  return selectBackups(backups, new Date(), config);
+}
+
 /**
  * 보관/삭제 대상을 가른다. 부수효과 없는 순수 함수 — 정책만 담는다.
+ * 원격 정리도 이 함수를 쓴다(목록만 ssh 로 받아 온다).
  *
- * 보관 규칙
- *   1) 최근 keep_recent_days 일 이내의 백업은 전부 보관
- *   2) 1..keep_monthly_months 개월 전 각 "달"의 마지막(최신) 백업 1개씩 보관
- *   3) 나머지는 삭제
+ * 보관 규칙: 최신 keep_count 건만 남기고 나머지는 삭제.
+ * 이 개수가 곧 `--rollback=N` 의 N 상한이다 — 남기지 않은 것은 되돌릴 수 없다.
  */
 function selectBackups(backups, now, config) {
   const opts = { ...DEFAULTS, ...(config || {}) };
-  const keepNames = new Map(); // name -> 보관 사유
+  const count = Math.max(0, Number(opts.keep_count) || 0);
 
-  const recentCutoff = now.getTime() - opts.keep_recent_days * 24 * 60 * 60 * 1000;
-  for (const backup of backups) {
-    if (backup.timestamp >= recentCutoff) {
-      keepNames.set(backup.name, `recent(<=${opts.keep_recent_days}d)`);
-    }
-  }
-
-  const nowMonth = monthKey(now);
-  for (let offset = 1; offset <= opts.keep_monthly_months; offset++) {
-    const targetMonth = nowMonth - offset;
-    // backups 는 최신순이므로 처음 만나는 것이 그 달의 마지막 버전이다.
-    const last = backups.find(b => monthKey(new Date(b.timestamp)) === targetMonth);
-    if (last && !keepNames.has(last.name)) {
-      keepNames.set(last.name, `monthly(-${offset}m last)`);
-    }
-  }
-
-  const keep = backups.filter(b => keepNames.has(b.name))
-    .map(b => ({ ...b, reason: keepNames.get(b.name) }));
-  const remove = backups.filter(b => !keepNames.has(b.name));
+  const keep = backups.slice(0, count).map((b, i) => ({ ...b, reason: `recent #${i + 1}` }));
+  const remove = backups.slice(count);
 
   return { keep, remove };
 }
@@ -93,7 +112,7 @@ function selectBackups(backups, now, config) {
  * 보관 정책을 실제로 적용한다.
  * 살아 있는 배포 경로는 어떤 경우에도 삭제 대상이 되지 않는다.
  */
-function applyRetention(deployPath, config, logger = console) {
+function applyRetention(deployPath, config, logger = console, backupRoot) {
   const opts = { ...DEFAULTS, ...(config || {}) };
 
   if (opts.enabled === false) {
@@ -101,7 +120,7 @@ function applyRetention(deployPath, config, logger = console) {
     return { keep: [], removed: [], failed: [] };
   }
 
-  const backups = listBackups(deployPath);
+  const backups = listBackups(deployPath, backupRoot);
   if (backups.length === 0) {
     logger.log(`[BackupRetention] No backup directories found for ${deployPath}.`);
     return { keep: [], removed: [], failed: [] };
@@ -109,8 +128,7 @@ function applyRetention(deployPath, config, logger = console) {
 
   const { keep, remove } = selectBackups(backups, new Date(), opts);
 
-  logger.log(`[BackupRetention] Policy: keep_recent_days=${opts.keep_recent_days}, ` +
-    `keep_monthly_months=${opts.keep_monthly_months}, dry_run=${!!opts.dry_run}`);
+  logger.log(`[BackupRetention] Policy: keep_count=${opts.keep_count}, dry_run=${!!opts.dry_run}`);
   logger.log(`[BackupRetention] Found ${backups.length} backup(s): keep ${keep.length}, remove ${remove.length}`);
   for (const item of keep) {
     logger.log(`  [keep]   ${item.name}  (${item.reason})`);
@@ -149,7 +167,10 @@ function applyRetention(deployPath, config, logger = console) {
 module.exports = {
   DEFAULTS,
   backupPatternFor,
+  stampNow,
+  parseStamp,
   listBackups,
+  selectFromNames,
   selectBackups,
   applyRetention
 };

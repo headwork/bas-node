@@ -12,15 +12,15 @@ class BackupCleanupStage extends BaseStage {
   async execute(stageConfig, basePath) {
     const config = stageConfig && typeof stageConfig === 'object' ? stageConfig : {};
     const vars = this.engine.context.variables;
-    const deployPath = config.deploy_path || vars.deploy_path;
+    const deployPath = config.web_deploy_path || vars.web_deploy_path;
 
     if (!deployPath) {
-      throw new Error("BackupCleanupStage requires 'deploy_path' (stage config or context variable).");
+      throw new Error("BackupCleanupStage requires 'web_deploy_path' (stage config or context variable).");
     }
 
     // 루트 backup: 블록이 기본, 스테이지 인자가 덮어쓴다.
     const merged = { ...(this.engine.context.backup || {}), ...config };
-    delete merged.deploy_path;
+    delete merged.web_deploy_path;
 
     applyRetention(deployPath, merged);
   }

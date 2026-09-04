@@ -1,2 +1,9 @@
 node_modules/
 dist/*.js
+.agents/
+.claude/settings.json
+.env
+
+# 설정 파일은 환경마다 다르고 자격증명이 들어간다. 샘플만 추적한다.
+dist/config/*.json
+!dist/config/project_sample.json

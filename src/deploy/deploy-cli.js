@@ -10,7 +10,7 @@ const USAGE = `
 사용법: node deploy-cli.js --yaml=<경로> [옵션]
 
   --yaml=<경로>          파이프라인 정의 (필수)
-  --params='{"k":"v"}'   외부 파라미터. cmd 에서는 --params="{\\"k\\":\\"v\\"}"
+  --params={"k":"v"}     외부 파라미터. cmd 에서는 따옴표 없이 이 형태가 안전하다
   --dry-run              실행하지 않고 계획만 출력
 
   --only=<그룹>          해당 group 의 스테이지만 실행 (젠킨스 단계 분할용)
@@ -18,17 +18,63 @@ const USAGE = `
   --project=<이름>       설정 프로젝트. 생략하면 YAML 의 project 를 쓴다
   --config-dir=<경로>    설정 폴더 직접 지정
 
+  --rollback=<N>         배포 없이 롤백만 실행한다. N 은 성공 배포 역순 번호
+                         1 = 직전 성공 배포의 백업으로 되돌린다 (2·3 은 그 이전)
+                         이력이 N 보다 적으면 가장 오래된 것으로 조정한다
+                         --dry-run 과 함께 쓰면 되돌릴 후보만 출력한다
+
   --cancel               해당 키의 실행에 취소를 요청한다 (스테이지 경계에서 멈춘다)
   --unlock               해당 키의 락을 해제한다
   --force-unlock         보유자와 무관하게 락을 해제한다
   --status               현재 락·최근 실행 상태를 출력한다
 `;
 
+/**
+ * `--params` 값을 객체로 만든다.
+ *
+ * 셸을 거치면 따옴표가 한 겹 더 남는 경우가 있다. 그러면 JSON.parse 가
+ * **객체가 아니라 문자열을 돌려주는데 예외가 나지 않는다.** 그 문자열이 그대로
+ * 엔진으로 흘러가 `{...overrideParams}` 에서 한 글자씩 변수로 펼쳐지고,
+ * environment 오버라이드는 조용히 사라진다 — prod 를 골라도 YAML 기본값으로
+ * 배포된다. 실제로 젠킨스 bat 인용에서 이 형태가 나왔다.
+ *
+ * 그래서 두 가지를 한다.
+ *   - 결과가 문자열이면 한 겹 더 벗긴다 (인용이 남은 경우)
+ *   - 끝내 평범한 객체가 아니면 **멈춘다**. 잘못된 환경으로 배포하느니 실패가 낫다.
+ */
+function parseParams(raw) {
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch (e) {
+    console.error(`--params 가 올바른 JSON 이 아닙니다: ${raw}`);
+    console.error(`  권장 형태: --params={"environment":"qa"}`);
+    process.exit(1);
+  }
+
+  // 따옴표가 한 겹 더 남아 문자열로 파싱된 경우를 되살린다.
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+      console.log('[params] 따옴표가 한 겹 더 있어 다시 해석했습니다.');
+    } catch (e) { /* 아래 검사에서 걸린다 */ }
+  }
+
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    console.error(`--params 는 객체여야 합니다. 받은 값: ${JSON.stringify(value)}`);
+    console.error(`  권장 형태: --params={"environment":"qa"}`);
+    process.exit(1);
+  }
+
+  return value;
+}
+
 function parseArgs(argv) {
   const a = {
     yamlFile: null, params: {}, dryRun: false,
     only: null, deployKey: null, project: null, configDir: null,
-    cancel: false, unlock: false, forceUnlock: false, status: false
+    cancel: false, unlock: false, forceUnlock: false, status: false,
+    rollback: 0
   };
 
   for (const arg of argv) {
@@ -37,19 +83,36 @@ function parseArgs(argv) {
     else if (arg.startsWith('--deploy-key=')) a.deployKey = arg.slice('--deploy-key='.length);
     else if (arg.startsWith('--project=')) a.project = arg.slice('--project='.length);
     else if (arg.startsWith('--config-dir=')) a.configDir = arg.slice('--config-dir='.length);
+    else if (arg.startsWith('--rollback=')) {
+      const n = Number(arg.slice('--rollback='.length));
+      if (!Number.isInteger(n) || n < 1) {
+        console.error(`--rollback 은 1 이상의 정수여야 합니다: ${arg}`);
+        console.error(`  예) --rollback=1  (직전 성공 배포로 되돌림)`);
+        process.exit(1);
+      }
+      a.rollback = n;
+    }
     else if (arg === '--dry-run') a.dryRun = true;
     else if (arg === '--cancel') a.cancel = true;
     else if (arg === '--unlock') a.unlock = true;
     else if (arg === '--force-unlock') { a.unlock = true; a.forceUnlock = true; }
     else if (arg === '--status') a.status = true;
     else if (arg.startsWith('--params=')) {
-      try {
-        a.params = JSON.parse(arg.slice('--params='.length));
-      } catch (e) {
-        console.error(`--params 가 올바른 JSON 이 아닙니다: ${arg.slice('--params='.length)}`);
-        console.error(`  cmd 에서는 따옴표를 이스케이프해야 합니다: --params="{\\"environment\\":\\"qa\\"}"`);
-        process.exit(1);
-      }
+      a.params = parseParams(arg.slice('--params='.length));
+    }
+    else {
+      // 모르는 인자는 반드시 거부한다.
+      //
+      // 조용히 무시하면 **의도하지 않은 실행**이 된다. 2026-08-28 젠킨스 빌드 #1 에서
+      // 실제로 그랬다 — 서버의 번들이 구판이라 `--unlock` 을 몰랐고, 그 인자를 버린 뒤
+      // "옵션 없는 실행" 으로 해석해 배포 전체를 돌렸다. 빌드가 실패한 뒤 정리하려던
+      // 한 줄이 git pull · 빌드 · 롤백을 일으켜 라이브 폴더를 갈아치웠다.
+      //
+      // 버전이 어긋났을 때 아무 일도 일어나지 않는 쪽이 옳다.
+      console.error(`알 수 없는 인자입니다: ${arg}`);
+      console.error(`  도구 버전이 옛것이면 새 옵션을 모릅니다. 번들을 갱신했는지 확인하십시오.`);
+      console.error(USAGE);
+      process.exit(1);
     }
   }
   return a;
@@ -61,7 +124,7 @@ function parseArgs(argv) {
  * 다만 상태를 전제로 하는 옵션이 쓰였다면 그대로 실패시킨다.
  */
 function openState(args, doc, environment) {
-  const needsState = !!(args.only || args.deployKey || args.cancel || args.unlock || args.status);
+  const needsState = !!(args.only || args.deployKey || args.cancel || args.unlock || args.status || args.rollback);
 
   let config;
   try {
@@ -100,7 +163,15 @@ async function main() {
 
   // 상태 경로를 정하려면 project·environment 가 먼저 필요하다. 엔진과 같은 우선순위를 쓴다.
   const doc = yaml.load(fs.readFileSync(yamlPath, 'utf8')) || {};
-  const environment = args.params.environment || doc.environment || 'dev';
+  const environment = args.params.environment || doc.environment;
+
+  // 기본값 'dev' 를 두지 않는다. 환경을 빠뜨린 실행이 **에러 없이** dev 로 배포되고,
+  // 락파일·상태기록까지 dev 로 남아 나중에 로그만 봐서는 구분되지 않는다.
+  if (!environment) {
+    console.error(`environment 가 정해지지 않았습니다. YAML 의 environment 키를 적거나 --params={"environment":"<이름>"} 로 넘기십시오.`);
+    if (doc.target) console.error(`  정의된 target: ${Object.keys(doc.target).join(', ')}`);
+    process.exit(1);
+  }
 
   let state;
   try {
@@ -139,6 +210,45 @@ async function main() {
     } catch (err) {
       console.error(`[lock] ${err.message}`);
       process.exit(1);
+    }
+    return;
+  }
+
+  // ---- 롤백만 실행 (젠킨스 롤백 잡) ----
+  //
+  // 배포와 같은 락을 잡는다. 배포 도중에 롤백이 들어오면 스왑 한가운데서
+  // 폴더가 바뀌는데, 그때는 라이브도 백업도 어디로 갔는지 알 수 없게 된다.
+
+  if (args.rollback) {
+    const rollbackKey = args.deployKey || generateKey(`rollback-${environment}`);
+    let held = false;
+
+    if (!args.dryRun) {
+      try {
+        state.acquireLock({ key: rollbackKey, stage: `rollback(${args.rollback})` });
+        held = true;
+      } catch (err) {
+        console.error(`\n[lock] ${err.message}`);
+        process.exit(1);
+      }
+    }
+
+    try {
+      const engine = new PipelineEngine(args.params);
+      await engine.runRollback(yamlPath, args.params, {
+        dryRun: args.dryRun,
+        lastDeploy: args.rollback,
+        state
+      });
+    } catch (err) {
+      console.error(`\n[Rollback] 실패: ${err.message}`);
+      if (held) { try { state.releaseLock(rollbackKey, { force: true }); } catch { /* 무시 */ } }
+      process.exit(1);
+    }
+
+    if (held) {
+      state.releaseLock(rollbackKey, { force: true });
+      console.log(`[lock] 해제했습니다 (key=${rollbackKey})`);
     }
     return;
   }

@@ -38,10 +38,12 @@ class ArchiveStage extends BaseStage {
     const srcParent = path.dirname(srcResolved);
     const srcName = path.basename(srcResolved);
 
+    // 이름에 시각을 넣지 않는다 — 매번 새 파일이 되어 로컬·원격 양쪽에 240MB 씩
+    // 무한히 쌓이는데 지우는 코드가 없었다. 덮어쓰는 편이 낫다.
+    // 어느 배포가 무엇을 올렸는지는 이력(archive_path·git_to)이 들고 있다.
     const destDir = config.dest || path.join(path.dirname(src), '_artifacts');
     const baseName = config.name || srcName;
-    const stamp = timestamp();
-    const zipPath = path.join(destDir, `${baseName}_${stamp}.zip`);
+    const zipPath = path.join(destDir, `${baseName}.zip`);
 
     fs.mkdirSync(destDir, { recursive: true });
     if (fs.existsSync(zipPath)) fs.rmSync(zipPath, { force: true });

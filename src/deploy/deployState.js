@@ -15,11 +15,19 @@ const path = require('path');
 
 // 단계 사이로 넘길 변수. 전체를 저장하지 않는다 — 자격증명이 섞여 들어가기 때문이다.
 const CARRY_KEYS = [
-  'git_from', 'git_to', 'has_changes', 'changed_count', 'changed_static_only',
-  'archive_path', 'artifact_path'
+  'git_from', 'git_to', 'has_changes', 'changed_count', 'changed_commit_count', 'changed_static_only',
+  'archive_path', 'artifact_path',
+  // 라이브를 이미 백업으로 치웠는가. 그룹을 나눠 부르면 프로세스가 새로 뜨는데,
+  // 이월하지 않으면 앞 그룹에서 스왑까지 끝낸 배포가 뒤 그룹의 실패로 롤백되지 않는다.
+  'rollback_armed',
+  // 이 배포가 만든 백업 폴더. **롤백이 읽는 값이다.**
+  // 폴더를 훑어 최신을 집는 방식은 그것이 성공한 배포였는지 알 수 없다.
+  // 되돌릴 대상을 고르려면 라이브 경로·원격 여부도 함께 있어야 한다.
+  'backup_path', 'web_deploy_path', 'deploy_remote', 'iis_site', 'host', 'port'
 ];
 
 const MAX_CHANGED_FILES = 500;
+const MAX_CHANGED_COMMITS = 300;
 
 class DeployState {
   constructor({ statePath, lockPath, keep = 10, ttlMinutes = 60 }) {
@@ -89,6 +97,9 @@ class DeployState {
         variables: {},
         changed_files: [],
         changed_files_truncated: 0,
+        changed_commits: [],
+        changed_commits_truncated: 0,
+        reverted_commits: [],
         announced: false,
         cancel_requested: false
       };
@@ -110,7 +121,7 @@ class DeployState {
   }
 
   /** 그룹 실행 결과와 이월 변수를 기록한다. */
-  recordGroup(key, group, { status, error, elapsedMs, variables, changedFiles }) {
+  recordGroup(key, group, { status, error, elapsedMs, variables, changedFiles, changedCommits, revertedCommits }) {
     this.#update(key, run => {
       run.groups[group] = {
         status,
@@ -123,6 +134,16 @@ class DeployState {
         run.changed_files = changedFiles.slice(0, MAX_CHANGED_FILES);
         run.changed_files_truncated = Math.max(0, changedFiles.length - MAX_CHANGED_FILES);
       }
+      if (Array.isArray(changedCommits)) {
+        // body 는 Revert 판정에만 쓰고 남기지 않는다 — 본문까지 담으면 상태 파일이 부푼다.
+        run.changed_commits = changedCommits
+          .slice(0, MAX_CHANGED_COMMITS)
+          .map(({ sha, short, author, date, subject }) => ({ sha, short, author, date, subject }));
+        run.changed_commits_truncated = Math.max(0, changedCommits.length - MAX_CHANGED_COMMITS);
+      }
+      if (Array.isArray(revertedCommits)) {
+        run.reverted_commits = revertedCommits;
+      }
     });
   }
 
@@ -132,6 +153,29 @@ class DeployState {
       if (error) run.error = String(error).slice(0, 500);
       run.finished_at = new Date().toISOString();
     });
+  }
+
+  /**
+   * 롤백 후보를 최신순으로 돌려준다 — **백업 경로가 남아 있는 성공 배포**만.
+   *
+   * `--rollback=N` 의 N 은 이 목록의 순번이다(1 = 직전 성공 배포).
+   * 소비된 백업(`backup_consumed`)은 빠진다 — 파이프라인 실패로 롤백이 그 폴더를
+   * 라이브로 되돌리면서 써버린 것이라, 없는 게 정상이다.
+   * 반면 이력에 살아 있는데 폴더가 없으면 **사람이 지운 것**이므로 후보로 두고
+   * 고르는 쪽에서 에러를 낸다 — 조용히 다음 것으로 넘어가면 의도보다 더 되돌아간다.
+   */
+  rollbackCandidates(environment) {
+    return this.load().runs.filter(r =>
+      r.status === 'success' &&
+      r.environment === environment &&
+      r.variables && r.variables.backup_path &&
+      !r.backup_consumed
+    );
+  }
+
+  /** 백업이 롤백에 쓰여 사라졌음을 표시한다. */
+  markBackupConsumed(key) {
+    this.#update(key, run => { run.backup_consumed = true; });
   }
 
   requestCancel(key) {
@@ -155,23 +199,34 @@ class DeployState {
   }
 
   /**
-   * 이력을 keep 개로 줄인다.
-   * 단, 아직 끝나지 않았거나 공지되지 않은 실행은 개수와 무관하게 남긴다 —
-   * 실패분 재공지가 그 기록에 의존하기 때문이다.
+   * 이력을 줄인다. **성공 이력은 환경별로 센다.**
+   *
+   *   성공  : 환경마다 keep 건 (이게 롤백 후보 목록이다)
+   *   실패  : 환경마다 keep 건 (원인 분석용)
+   *   진행중: 개수와 무관하게 남긴다
+   *
+   * 예전에는 `announced === false` 인 실행을 무조건 남겼는데, **`announced` 를 true 로
+   * 만드는 코드가 어디에도 없어서**(2026-09-01 확인) 사실상 아무것도 지워지지 않았다.
+   * 죽은 조건이 보관 규칙을 통째로 무력화한 자리다 — 그래서 걷어냈다.
+   *
+   * 환경별로 세는 이유: dev 배포가 잦아서 전체 개수로 자르면 qa·prod 이력이 밀려난다.
    */
   #prune(doc) {
-    const mustKeep = r => r.status === 'running' || r.announced === false;
+    const counters = new Map();   // `${environment}:${bucket}` -> 개수
     const kept = [];
-    let normal = 0;
 
     for (const r of doc.runs) {
-      if (mustKeep(r)) { kept.push(r); continue; }
-      if (normal < this.keep) { kept.push(r); normal++; }
+      if (r.status === 'running') { kept.push(r); continue; }
+
+      const bucket = r.status === 'success' ? 'success' : 'other';
+      const slot = `${r.environment}:${bucket}`;
+      const used = counters.get(slot) || 0;
+      if (used < this.keep) {
+        counters.set(slot, used + 1);
+        kept.push(r);
+      }
     }
 
-    if (kept.length > this.keep * 3) {
-      console.log(`[state] 보존 대상이 ${kept.length}건입니다 (미완료·미공지 누적). 확인이 필요합니다.`);
-    }
     doc.runs = kept;
   }
 

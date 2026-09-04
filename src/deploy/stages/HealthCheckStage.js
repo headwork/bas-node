@@ -3,7 +3,9 @@ const axios = require('axios');
 
 class HealthCheckStage extends BaseStage {
   async execute(stageConfig, basePath) {
-    const url = stageConfig.url;
+    // 주소는 서버 블록의 `health_url` 이 정본이다 — 배포 대상에 딸린 값이라
+    // stages 에 다시 적지 않는다. 스테이지에 직접 적으면 그것이 이긴다.
+    const url = stageConfig.url || this.engine.context.variables.health_url;
     const maxRetries = stageConfig.retry || 10;
     const intervalSec = stageConfig.interval_sec || 5;
 
@@ -23,7 +25,7 @@ class HealthCheckStage extends BaseStage {
     const followRedirects = stageConfig.follow_redirects !== false;
 
     if (!url) {
-      throw new Error("HealthCheckStage requires 'url' parameter.");
+      throw new Error("HealthCheckStage requires 'url' (스테이지 설정 또는 health_url 변수).");
     }
 
     console.log(`[HealthCheckStage] Starting health check for ${url}`);

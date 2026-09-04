@@ -23,30 +23,63 @@ const APP_FILE = 'app.json';
  * 런처가 cd 를 하거나 젠킨스가 다른 위치에서 부를 수 있기 때문이다.
  */
 function resolveConfigDir(explicit) {
+  const isDir = (p) => {
+    try { return fs.existsSync(p) && fs.statSync(p).isDirectory(); }
+    catch { return false; }
+  };
+
+  // 사람이 직접 지정한 곳은 무조건 이긴다. 비어 있어도 의도가 우선이다.
+  //
+  // 지정했는데 그 폴더가 없으면 **여기서 멈춘다.** 자동탐색으로 물러서면
+  // 오타 하나로 다른 프로젝트의 설정을 들고 배포가 시작되는데, 경로도 상태파일도
+  // 그럴듯해서 에러가 나지 않는다. 지정한 곳이 없다는 사실 자체가 실패다.
+  for (const [label, forced] of [['--config-dir', explicit], ['BAS_CONFIG_DIR', process.env.BAS_CONFIG_DIR]]) {
+    if (!forced) continue;
+    if (isDir(forced)) return path.resolve(forced);
+    throw new Error(
+      `${label} 로 지정한 설정 폴더가 없습니다: ${path.resolve(forced)}\n` +
+      `  자동탐색으로 넘어가지 않습니다 - 다른 설정으로 배포되는 것을 막기 위함입니다.`
+    );
+  }
+
   // 번들과 소스는 __dirname 이 다르다.
   //   번들: <bundle>/bas-deploy.js  -> __dirname = <bundle>
   //   소스: <repo>/src/config/      -> __dirname = <repo>/src/config
   // 양쪽을 모두 후보에 넣는다. 하나만 넣으면 다른 쪽에서 설정을 통째로 못 찾는다.
   const candidates = [
-    explicit,
-    process.env.BAS_CONFIG_DIR,
     path.join(__dirname, 'config'),                     // 번들: <bundle>/config
     path.join(__dirname, '..', 'config'),
     path.join(__dirname, '..', '..', 'config'),
     path.join(__dirname, '..', '..', 'dist', 'config'), // 소스: <repo>/dist/config
     path.join(process.cwd(), 'config'),
-  ].filter(Boolean);
+  ].map(p => path.resolve(p));
 
-  // app.json 이 아니라 폴더 존재로 판정한다.
-  // app.json 은 git 추적 대상이 아니라 신규 클론에는 없을 수 있다 —
-  // 그것을 기준으로 삼으면 설정 폴더를 통째로 못 찾는다.
-  for (const dir of candidates) {
-    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return path.resolve(dir);
-  }
+  const found = candidates.filter(isDir);
+
+  // 존재만으로 고르면 **소스 실행에서 로더 자신의 폴더가 먼저 걸린다.**
+  // `<repo>/src/config` 는 이 파일이 사는 자리고 설정이 하나도 없는데,
+  // `path.join(__dirname,'..','config')` 가 정확히 그 경로라 항상 이긴다.
+  // 그러면 뒤에 있는 `<repo>/dist/config` 는 영영 후보에 오르지 못하고,
+  // 배포는 **에러 없이** 상태기록 없는 폴백으로 떨어진다(2026-09-01 실측).
+  //
+  // 그래서 app.json 이 실제로 있는 폴더를 1순위로 본다. 없으면 존재하는 첫 폴더로
+  // 물러서되 로더 자신의 폴더는 뺀다 — app.json 은 git 추적 대상이 아니라
+  // 신규 클론에는 없을 수 있고, 그것만을 기준으로 삼으면 통째로 못 찾는다.
+  const withApp = found.find(dir => fs.existsSync(path.join(dir, APP_FILE)));
+  if (withApp) return withApp;
+
+  const fallback = found.find(dir => dir !== path.resolve(__dirname));
+  if (fallback) return fallback;
+
+  // 지정한 경로가 없어서 여기까지 온 경우가 가장 흔하다. 목록에 함께 보여준다 —
+  // 빠뜨리면 "--config-dir 을 줬는데 왜 못 찾나"를 로그만으로는 알 수 없다.
+  const forcedPaths = [explicit, process.env.BAS_CONFIG_DIR]
+    .filter(Boolean)
+    .map(p => `${path.resolve(p)}  (지정했으나 폴더가 아님)`);
 
   throw new Error(
     `설정 폴더를 찾지 못했습니다. 찾아본 경로:\n  ` +
-    candidates.map(c => path.resolve(c)).join('\n  ') +
+    [...forcedPaths, ...candidates].join('\n  ') +
     `\n  BAS_CONFIG_DIR 환경변수나 --config-dir 로 지정할 수 있습니다.`
   );
 }

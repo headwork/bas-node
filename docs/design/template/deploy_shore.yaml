@@ -1,46 +1,196 @@
 # deploy_shore.yaml
 name: "Deploy MFM.SHORE_QA"
 project: "hlngs"
-environment: "qa"
-deploy_path: "D:/Deploy"
-# 젠킨스나 .env에 등록된 GIT_API_KEY를 치환하여 사용합니다.
-git_url: "http://sghwang:${env.GIT_API_KEY}@112.217.163.10:16784/WeSys.git"
+environment: "dev"                                  # --params={"environment":"qa"} 로 덮는다
+deploy_root: "D:/Deploy"
+# ⚠️ URL 에 자격증명을 넣지 않는다. 젠킨스가 withCredentials(git_wesys) 로 넣어 주는
+#    GIT_ASKPASS 가 git 의 프롬프트에 답한다 (docs/design/배포/04_젠킨스_잡.md).
+#    URL 삽입은 Bonobo 에서 정상 자격을 덮어써 인증을 깨뜨리고, 자격증명이
+#    .git/config 의 remote URL 에 그대로 남는다.
+#    ${env.X} 는 미정의여도 에러 없이 빈 문자열이 된다(PipelineEngine.interpolate) —
+#    자격증명을 URL 에 두면 "인증 실패" 외에는 아무 단서가 남지 않는다.
+git_url: "http://112.217.163.10:16784/WeSys.git"
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 서버 환경
+#     빌드 서버 : 프로젝트 소스폴더(git), 빌드폴더, 게시 프로파일, 빌드 명령
+#     배포 서버 : 웹서비스가 실행되는 서버, 접속정보, 업로드 경로, 라이브 폴더, IIS
+#
+# 참조는 YAML 앵커(`*이름`)로 한다 — **없는 이름을 쓰면 파서가 파싱 단계에서 죽인다.**
+# 문자열 이름(`build_server: "local"`)도 받지만, 그쪽은 오타를 엔진이 잡아야 한다.
+#
+# ⚠️ 블록 안에서 `name:` 을 쓰지 않는다. 이 키들은 전부 변수로 펼쳐지므로
+#    루트의 `name:`(파이프라인 이름)을 덮어버린다 — 에러 없이, 로그에서만 티가 난다.
+#    엔진이 서버를 부르는 이름은 카탈로그 키(local·qa·prod)다.
+# ─────────────────────────────────────────────────────────────────────────────
+server_list:
+  local: &local_jenkins
+    server_name: "local_jenkins"
+    source_path: "${deploy_root}/jenkins_home/workspace/hlngsGitPullRelease"
+    build_root: "${deploy_root}/build"                # 산출물 루트. 폴더명은 target 이 붙인다
+    profile_dir: "D:/Deploy/jenkins/project_hlngs"    # 게시 프로파일(pubxml) 보관 위치
+
+    # 빌드 명령은 빌드축이다 — "이 서버에서 이 프로젝트를 어떻게 짓는가".
+    # 환경마다 같으므로 target 세 곳에 복사하지 않는다(한 곳만 고쳐지는 날이 온다).
+    #
+    # 명령 자체는 **스크립트 파일**에 둔다. yaml 에는 무엇을 부르는지만 남는다 —
+    # 빌드 방식(dotnet·gradle·python)이 바뀌어도 파이프라인은 그대로다.
+    # 스크립트는 게시 프로파일 옆(profile_dir)에 산다. 둘 다 이 프로젝트·이 서버의 것이다.
+    #
+    # 게시 프로파일(pubxml)을 프로젝트 안으로 복사하고 **이름만** dotnet 에 넘기는 것도
+    # 스크립트가 한다 — .NET 만의 사정이라 파이프라인은 알 필요가 없다.
+    # (전체경로를 주면 SDK 가 못 찾고 NETSDK1198 경고만 남긴 채 게시를 건너뛰는데
+    #  exit 0 으로 끝나서, 이전 산출물이 새것인 척 배포된다.)
+    # ⚠️ 산출물 경로(build_path)를 스크립트에 넘긴다. 게시 프로파일(pubxml)에도 같은
+    #    뜻의 PublishUrl 이 있어서, 두 곳이 어긋나면 **에러 없이** 갈린다 —
+    #    dotnet 은 pubxml 이 적은 곳에 게시하고 파이프라인은 여기 적힌 곳을 보므로,
+    #    낡은 산출물이 새것인 척 배포된다(2026-09-04 QA 에서 실제로 걸렸다).
+    #    스크립트가 **프로파일 사본**의 PublishUrl 을 이 값으로 덮으므로,
+    #    경로의 정본은 이 yaml 하나다. pubxml 원본은 건드리지 않는다.
+    build_cwd: "${source_path}/MFM.Shore/Web"
+    build_cmd: "\"${profile_dir}\\build_shore.bat\" \"${build_profile}\" \"${build_path}\""
+
+    # 이 블록은 배포 대상으로도 쓰인다(dev). 그때 필요한 값들.
+    web_deploy_path: "${deploy_root}/MFM.SHORE_QA"    # 라이브 폴더 = IIS physicalPath
+    backup_root: "${deploy_root}/_backup"             # 백업 보관 폴더. 라이브와 같은 볼륨이어야 한다
+    iis_site: "MFM.SHORE_QA"
+    health_url: "https://localhost:8443/healthz"
+
+  qa_server: &qa_server
+    server_name: "qa_deploy"
+    ssh:                                         # ssh접속정보는 보안상 config 설정으로
+      host: "221.139.50.188"
+      port: 9222
+    upload_path: "D:/HLNGS/build"                # 압축파일이 도착할 원격 폴더
+    web_deploy_path: "D:/Deploy/MFM.SHORE_QA"    # 원격 라이브 폴더 = IIS physicalPath
+    backup_root: "D:/HLNGS/backup"               # 백업 보관 폴더. 라이브와 같은 볼륨이어야 한다
+    iis_site: "MFM.SHORE_QA"                     # 생략하면 web_deploy_path 끝 폴더명으로 유추
+    health_url: "https://wesysqa.hls.co.kr/healthz"
+
+  prod_server: &prod_server
+    <<: *qa_server
+    server_name: "prod_deploy"
+    web_deploy_path: "D:/Deploy/MFM.SHORE"
+    iis_site: "MFM.SHORE"
+    health_url: "https://wesys.hls.co.kr/healthz"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# target 은 조합표다 — 어느 빌드서버에서 만들어 어느 배포서버로 보낼지.
+# 여기 직접 적은 값이 서버 블록을 이긴다(부분 덮어쓰기).
+#
+# 엔진은 환경 이름(dev·qa·prod)을 보지 않는다. 갈래는 아래 설정값이 정한다.
+#
+#   build_server    어디서 빌드하나
+#   deploy_server   어디에 배포하나 (로컬이든 원격이든 반드시 적는다)
+#   deploy_remote   true 면 deploy_server 에 원격접속해서 배포한다. 생략 시 true
+#   compress        생략 시 true. 원격 배포는 zip 하나로 보내므로 끌 수 없다
+#
+# ⚠️ 이 파서는 머지키 `<<:` 를 해석하지 않고 리터럴 키로 남긴다. 엔진이 대신 펼치는데
+#    **그 대상은 server_list 블록뿐이다**(resolveServer -> expandMergeKeys).
+#    target 블록에 `<<:` 를 쓰면 아무것도 병합되지 않고 **에러도 나지 않는다.**
+# ─────────────────────────────────────────────────────────────────────────────
 target:
-  qa:
+  dev:
     branch: "deploy/qa"
-    deploy_path: "${deploy_path}/MFM.SHORE_QA"
-    build_path: "${deploy_path}/build/MFM.SHORE_QA"
+    build_server: *local_jenkins
+    build_path: "${build_root}/MFM.SHORE_QA"
+    build_profile: "${profile_dir}/wesysProfileDev.pubxml"
+
+    deploy_server: *local_jenkins
+    deploy_remote: false        # 이 서버 안에서 끝낸다
+    compress: false             # 690MB 를 zip 하는 데 약 7분. 로컬은 zip 을 쓰지 않는다
     confluence: false
     telegram: false
+
+  qa:
+    branch: "deploy/qa"
+    build_server: *local_jenkins
+    build_path: "${build_root}/MFM.SHORE_QA"
+    build_profile: "${profile_dir}/wesysProfileQA.pubxml"
+
+    deploy_server: *qa_server
+    confluence: false
+    telegram: false
+
   prod:
     branch: "master"
-    deploy_path: "${deploy_path}/MFM.SHORE"
-    build_path: "${deploy_path}/build/MFM.SHORE"
+    build_server: *local_jenkins
+    build_path: "${build_root}/MFM.SHORE"
+    build_profile: "${profile_dir}/wesysProfilePord.pubxml"
+
+    deploy_server: *prod_server
     confluence: false
     telegram: true
 
-# 백업 보관 정책 (#P001-OQ2). local_deploy 성공 직후 자동 적용된다.
+# ─────────────────────────────────────────────────────────────────────────────
+# 서버 설정 보전
+#
+# 배포는 폴더를 통째로 갈아끼운다. 그냥 두면 소스에 든 설정이 서버 설정을 덮는다.
+#
+#   exclude          빌드가 끝나면 산출물에서 지운다. 소스 설정은 서버까지 가지도 않는다
+#   preserve_config  라이브의 설정을 새 배포본으로 옮긴다. IIS 정지 **전**에 끝낸다
+#   config_backup    옮긴 설정의 사본을 두는 곳
+#
+# 설정을 바꾸려면 두 가지 길이 있고, 규칙은 하나다 —
+# **config_backup 의 파일이 라이브보다 최근이면 그쪽이 이긴다.**
+#
+#   운영 중 서버에서 직접 수정   -> 라이브가 최근이므로 그대로 유지된다
+#   개발자가 config_backup 수정  -> 더 최근이므로 다음 배포가 가져간다
+#
+# ⚠️ 다른 PC 에서 복사해 온 파일은 수정시각이 과거라 안 들어간다. 오류가 아니라 규칙이다.
+#    넣으려면 서버에서 손을 대서 시각을 올린다.
+#
+# ⚠️ 배포는 설정 파일의 시각을 찍지 않는다. 찍으면 라이브가 언제나 최신이 되어 위 규칙이
+#    죽는다. 그래서 이 파일들의 '수정한 날짜' 는 **설정이 마지막으로 바뀐 때**를 뜻한다.
+#
+# 목록의 파일이 라이브에도 config_backup 에도 없으면 배포를 실패시킨다 —
+# 설정 없는 배포본이 라이브가 되는 것보다 낫다. 최초 설치는 사람이 한 번 넣는다.
+# ─────────────────────────────────────────────────────────────────────────────
+exclude:
+  - "appsettings*.json"    # 산출물 루트만 본다. 하위 폴더는 훑지 않는다
+  - "web.config"
+  
+preserve_config:
+  - "web.config"           # exclude 하지 않는다 - 없으면 IIS 가 500.19 로 뜬다
+  - "appsettings.json"
+
+config_backup: "${backup_root}/config/${environment}"
+
+# 백업 보관 정책. 배포 성공 직후 자동 적용된다 (로컬·원격 모두).
+# 이 개수가 곧 `--rollback=N` 의 N 상한이다 — 남기지 않은 것은 되돌릴 수 없다.
 backup:
-  keep_recent_days: 7      # 최근 7일치 백업은 전부 보관
-  keep_monthly_months: 2   # 1개월 전 · 2개월 전 각각 마지막 1개 보관
+  keep_count: 3            # 최근 성공 배포 3건의 백업만 남긴다 (1회 690MB)
   dry_run: false           # true 로 두면 삭제 대상만 출력하고 지우지 않는다
 
+# ─────────────────────────────────────────────────────────────────────────────
+# stages 에는 설정을 두지 않는다 — 순서 · 그룹 · 갈래만이다.
+# 경로·명령·주소는 전부 server_list / target 에서 온다.
+#
 # group 은 --only 로 나눠 실행할 단위다. 젠킨스가 그룹마다 따로 호출하면
 # 각 단계의 성공/실패가 stage view 에 그대로 보인다.
 #   basDeploy.bat --yaml=... --only=git_check --deploy-key=<키>
 # 같은 deploy_key 를 넘겨야 앞 단계의 판정(changed_static_only 등)이 이어진다.
+# ─────────────────────────────────────────────────────────────────────────────
 stages:
-  - git_sync:                    # target 설정값을 읽어 자동 git 동기화
-      group: git_check
-  - c#_build:                    # target 설정값을 읽어 자동 빌드
-      group: build
-  - local_deploy:                # IIS 정지 -> 폴더 백업/스왑 -> IIS 시작 -> 백업 정리
-      group: deploy
-  - confluence:                  # confluence: true 인 경우만 동작
-      group: deploy
+  - git_sync:      { group: git_check }                  # branch·source_path 를 읽어 동기화
+  - build:         { group: build }                      # build_cwd·build_cmd·build_profile
+  - archive:       { group: build,  if: compress }       # build_path -> _artifacts/*.zip
+  - remote_deploy: { group: deploy, if: deploy_remote }  # scp -> 해제 -> IIS정지 -> 스왑 -> 시작
+  - health_check:  { group: deploy, if: deploy_remote }  # health_url
+  - local_deploy:  { group: deploy, unless: deploy_remote }   # IIS정지 -> 백업/스왑 -> 시작
+  - confluence:    { group: deploy }                     # confluence: true 인 경우만 동작
 
-# 파이프라인이 실패하면 실행된다 (#P001-REQ5).
-# 실패한 배포본은 <deploy_path>_failed_<timestamp> 로 남으므로 확인 후 직접 정리해야 한다.
+# 배포가 실패하면 실행된다. 백업 폴더로 라이브를 되돌린다.
+# 백업이 없으면(라이브를 건드리기 전에 실패) 아무것도 하지 않는다.
+#
+# 젠킨스 롤백 잡에서 직접 부를 수도 있다. 그때는 배포 이력에서 골라 되돌린다.
+#   basDeploy.bat --yaml=... --rollback=1     1 = 직전 성공 배포 (최대 backup.keep_count)
+#   basDeploy.bat --yaml=... --rollback=1 --dry-run    되돌릴 후보만 출력
+#
+# 실패한 배포본은 <라이브>_failed_<시각> 으로 남으므로 확인 후 직접 정리한다.
+# TODO: 백업 폴더 대신 git commit id 로 재배포하는 방식을 추가할 예정
 rollback:
-  - local_rollback: {} # IIS 정지 -> 실패본 격리 -> 최신 백업 복구 -> IIS 시작
+  - local_rollback:  { unless: deploy_remote }
+  - remote_rollback: { if: deploy_remote }
