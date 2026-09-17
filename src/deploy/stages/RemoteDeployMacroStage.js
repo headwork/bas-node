@@ -1,25 +1,34 @@
 const BaseStage = require('./BaseStage');
 const path = require('path');
-const { stampNow, selectFromNames } = require('../backupRetention');
+const { stampNow, backupName, selectFromNames } = require('../backupRetention');
 const { decideConfigSource, formatDecision, ticksToEpochMs } = require('../configPreserve');
+const { makeSshRunner } = require('../sshRunner');
+const { syncRemoteScripts, defaultScriptDir } = require('../scriptSync');
+const { DEPLOY, reasonFor } = require('../scriptExit');
+const { assertRemotePath } = require('../remoteEnv');
+const { joinPreserve } = require('../scriptArgs');
 
 /**
  * 원격 서버 배포 매크로. local_deploy 와 같은 순서를 SSH 너머에서 수행한다.
  *
+ *   0. 공용 스크립트 동기화      scp   (#P002-TASK5)
  *   1. 압축파일 업로드           scp -P <port>
  *   2. 원격 임시폴더에 압축해제  ssh tar -xf
- *   3. IIS 정지                  ssh appcmd stop site/apppool
- *   4. 라이브 -> 백업 (rename)   ssh move
- *   5. 임시 -> 라이브 (rename)   ssh move
- *   6. IIS 시작                  ssh appcmd start
+ *   3. 정지 → 백업 → 스왑 → 시작 ssh deploy.bat   ← **한 번이다** (#P002-TASK7)
+ *   4. 오래된 백업 정리          ssh dir + rmdir
  *
  * **복사가 아니라 rename 이다.** 수천 개 파일을 원격으로 복사하면 오래 걸리고 중간에
  * 끊기면 반쪽짜리 배포본이 서비스된다. rename 은 같은 볼륨에서 사실상 원자적이라
  * 서비스 정지 시간이 초 단위로 끝난다.
  *
- * 4·5 단계 사이에서 실패하면 라이브 폴더가 없는 상태가 되므로, 그 구간의 실패는
- * 잡아서 즉시 되돌린다(#rollbackSwap). 되돌린 뒤에도 IIS 는 반드시 다시 세운다 —
- * 배포는 실패해도 서비스는 살아 있어야 한다.
+ * ## 3단계를 왜 쪼개지 않나 — 덩어리는 스크립트, 판단은 Node (`[D10]`)
+ *
+ * 두 rename 사이에는 **라이브 폴더가 존재하지 않는다.** 예전에는 그 구간이 ssh 왕복을
+ * 사이에 두고 벌어져 있어서, 네트워크가 끊기는 순간이 곧 "라이브 없음" 이 되고 되돌릴
+ * 주체가 아무도 없었다. 한 스크립트 안이면 되돌리기까지가 원격에서 끝난다.
+ *
+ * Node 가 계속 쥐는 것은 **판단**이다 — 무엇을 올릴지, 해제 결과가 비었는지,
+ * 설정 파일 중 어느 쪽이 최신인지, 어떤 백업을 지울지, 그리고 **되돌릴 수 있는 상태인지**.
  *
  * ⚠️ 원격 명령은 ssh "..." 안에 통째로 들어간다. 경로에 공백이 있으면 따옴표 중첩으로
  *    깨진다. 공백 없는 경로를 쓰거나, 쓰려면 원격 스크립트 파일로 빼야 한다.
@@ -62,9 +71,21 @@ class RemoteDeployMacroStage extends BaseStage {
       throw new Error(`RemoteDeployMacroStage 에 필요한 값이 없습니다: ${missing.join(', ')}`);
     }
 
-    // IIS 사이트명. local_deploy 와 같은 규약 — 명시값 우선, 없으면 배포경로 끝 폴더명.
-    const siteName = cfg('remote_iis_site') || si.iis_site || path.basename(deployPath.replace(/[\\/]+$/, ''));
-    const manageIis = stageConfig.manage_iis !== false;
+    // 웹서버 대상 이름. local_deploy 와 같은 규약 — 명시값 우선, 없으면 배포경로 끝 폴더명.
+    const siteName = cfg('web_server_name') || cfg('remote_iis_site') || si.iis_site
+      || path.basename(deployPath.replace(/[\\/]+$/, ''));
+    // `web_server.type` 이 없으면 iis 로 본다. 지금까지 이 도구가 다룬 것이 IIS 뿐이라,
+    // 기존 YAML 이 수정 없이 그대로 돌아야 한다 (#P002-REQ5).
+    const wsType = cfg('web_server_type') || 'iis';
+    const wsPool = cfg('web_server_pool');
+    // 원격 스크립트가 놓이는 자리. upload_path 가 이미 프로젝트별이라 격리가 따라온다.
+    // ⚠️ `win()` 은 아래에서 선언되므로 여기서 부르면 TDZ 다. 직접 바꾼다.
+    const scriptDir = cfg('remote_script_dir')
+      || `${String(uploadPath).replace(/\//g, '\\')}\\_scripts\\windows`;
+    // 그 원본이 있는 **도구 서버** 폴더. 로컬 매크로가 쓰는 값과 같은 것이다 —
+    // 스크립트는 한 벌이고, 원격이냐 로컬이냐는 실행 경로의 차이일 뿐이다.
+    const localScriptDir = cfg('script_dir') || defaultScriptDir(vars);
+    const manageIis = stageConfig.manage_iis !== false && cfg('web_server_type') !== 'none';
 
     // 원격 명령은 cmd.exe 가 받는다. **cmd 의 mkdir·move·if not exist 는 슬래시 경로를
     // 거부한다** — `mkdir D:/x` 는 "명령 구문이 올바르지 않습니다" 로 죽는다(2026-09-01 실측).
@@ -78,8 +99,8 @@ class RemoteDeployMacroStage extends BaseStage {
     // 백업은 `backup_root` 에 모은다. 지정하지 않으면 라이브 옆에 만든다.
     // ⚠️ 라이브와 같은 볼륨이어야 한다 — cmd 의 move 도 볼륨이 다르면 복사가 된다.
     const backupRoot = cfg('backup_root') ? win(cfg('backup_root')) : null;
-    const backupName = `${path.basename(livePath)}_backup_${stamp}`;
-    const backupPath = backupRoot ? `${backupRoot}\\${backupName}` : `${livePath}_backup_${stamp}`;
+    const backupDir = backupName(livePath, stamp);
+    const backupPath = backupRoot ? `${backupRoot}\\${backupDir}` : `${livePath}_${stamp}`;
     const tempPath = `${livePath}_temp_${stamp}`;
     const remoteFile = `${win(uploadPath)}\\${path.basename(archivePath)}`;
 
@@ -95,6 +116,21 @@ class RemoteDeployMacroStage extends BaseStage {
     console.log(`- Artifact : ${path.basename(archivePath)}`);
 
     const ssh = this.#sshRunner({ target, port, keyPath, basePath });
+
+    // 0. 공용 스크립트를 원격에 맞춘다 (#P002-TASK5)
+    //
+    //    **아무것도 건드리기 전에 한다.** 스크립트가 없다는 사실을 Step 3(스왑)에서 만나면
+    //    업로드와 압축해제를 다 하고 나서 실패한다. 여기서 멈추면 원격은 손도 대지 않은 상태다.
+    //    사유는 scriptSync.js 에 적어 뒀다 — 요점은 "매번 덮어쓴다" 이다.
+    //
+    //    ⚠️ `manage_iis:false` 여도 건너뛰지 않는다. TASK7 이후 **폴더를 옮기는 것도**
+    //       스크립트가 하므로, 웹서버를 안 만진다고 스크립트가 필요 없어지지 않는다.
+    if (cfg('sync_scripts') !== false) {
+      console.log(`[RemoteDeploy] Step 0: 공용 스크립트 동기화 -> ${scriptDir}`);
+      syncRemoteScripts(this.engine, {
+        ssh, localDir: localScriptDir, remoteDir: scriptDir, target, port, keyPath, basePath
+      });
+    }
 
     // 1. 업로드
     console.log(`\n[RemoteDeploy] Step 1: Uploading artifact`);
@@ -139,6 +175,9 @@ class RemoteDeployMacroStage extends BaseStage {
     //   IIS 정지 **전**이다. 설정 파일은 런타임에 아무도 쓰지 않으므로 지금 떠도 되고,
     //   정지 구간에는 rename 두 번만 남는다.
     const preserveConfig = stageConfig.preserve_config || this.engine.context.preserveConfig || [];
+    // 운영 중 생성되어 배포 뒤에도 유지해야 하는 항목. 스크립트가 **정지한 뒤에** 옮긴다 —
+    // 서비스가 살아 있으면 파일이 쓰이는 중이라 사본이 깨진다.
+    const preserve = stageConfig.preserve || this.engine.context.preserve || [];
     const configBackup = cfg('config_backup') ? win(cfg('config_backup')) : null;
 
     if (preserveConfig.length > 0) {
@@ -185,43 +224,73 @@ class RemoteDeployMacroStage extends BaseStage {
       }
     }
 
-    // 3. IIS 정지
-    if (manageIis) {
-      console.log(`[RemoteDeploy] Step 3: Stopping IIS`);
-      this.#iis(ssh, 'stop', siteName);
-    } else {
-      console.log(`[RemoteDeploy] Step 3: IIS 제어 건너뜀 (manage_iis: false)`);
-    }
+    // 3. 정지 → 백업 → 스왑 → 시작. **ssh 한 번이다** (#P002-TASK7).
+    //
+    //    쪼개면 안 되는 이유는 왕복 비용이 아니라 **라이브가 비는 구간** 때문이다.
+    //    두 move 사이에는 라이브 폴더가 존재하지 않는다. 그 사이에 ssh 왕복이 끼면
+    //    네트워크가 끊기는 순간이 곧 "라이브 없음" 이 되고, 그때 되돌릴 주체가 없다.
+    //    한 스크립트 안이면 두 move 가 같은 프로세스에서 붙어 있고, 실패하면 그 자리에서
+    //    되돌린다 — 되돌리기까지가 원격에서 끝난다.
+    //
+    //    예전에는 여기가 ssh 5회(정지·mkdir·move·move·시작)였다.
+    assertRemotePath(`${scriptDir}\\deploy.bat`);
 
-    // 4·5. 스왑. 이 구간에서 실패하면 라이브가 비므로 즉시 되돌린다.
-    let swapped = false;
-    try {
-      console.log(`[RemoteDeploy] Step 4: ${livePath} -> ${backupPath}`);
-      if (backupRoot) ssh(`if not exist ${backupRoot} mkdir ${backupRoot}`);
-      ssh(`move ${livePath} ${backupPath}`);
-      swapped = true;
+    console.log(`[RemoteDeploy] Step 3: 정지 -> 백업 -> 스왑 -> 시작 (deploy.bat)`);
+    console.log(`  live   ${livePath}`);
+    console.log(`  staged ${tempPath}`);
+    console.log(`  backup ${backupPath}`);
 
-      // 이 지점부터 원격 라이브가 비어 있다. 이후의 실패만 롤백 대상이다.
+    const r = ssh(`${scriptDir}\\deploy.bat`, {
+      capture: true,
+      allowFailure: true,
+      env: {
+        DP_LIVE: livePath,
+        DP_STAGED: tempPath,
+        DP_BACKUP: backupPath,
+        DP_BACKUP_ROOT: backupRoot || undefined,   // 없으면 안 싣는다. 스크립트가 없는 대로 판단한다
+        // 운영 중 생성된 항목(업로드 폴더 등)을 새 배포본으로 옮긴다.
+        // **원격에는 없던 기능이다** — 로컬 매크로에만 있었는데, 같은 스크립트를 쓰게 되면서
+        // 따라왔다. 쪼개진 구현을 합치면 이런 것이 저절로 메워진다.
+        DP_PRESERVE: joinPreserve(preserve) || undefined,
+        // 웹서버 변수는 `deploy.bat` 이 해석하지 않고 어댑터로 **그대로 상속**시킨다.
+        WS_SKIP: manageIis ? undefined : '1',
+        WS_TYPE: manageIis ? wsType : undefined,
+        WS_NAME: manageIis ? siteName : undefined,
+        WS_POOL: manageIis ? wsPool : undefined
+      }
+    });
+
+    const out = (r.output || '').trim();
+    if (out) out.split(/\r?\n/).forEach(line => console.log(`  ${line}`));
+
+    // 무장 여부는 **종료코드가 정한다.** 백업이 실재할 때만 무장해야 한다 —
+    // 없는 폴더로 무장하면 롤백이 "이력에는 남아 있습니다. 누가 지웠는지 확인하십시오"
+    // 라는 엉뚱한 말을 하고 멈춘다. 진짜 사고를 그 소음에 묻는 셈이다.
+    //
+    //   0      배포됨. 백업이 있다            -> 무장 (health check 가 실패하면 되돌린다)
+    //   1      라이브가 살아 있다.            -> 무장하지 않는다
+    //          백업은 만들어지지 않았거나 되돌리며 소비됐다
+    //   2·3·4  아무것도 옮기기 전이다          -> 무장하지 않는다
+    //   5      라이브가 없다. 백업이 유일한 사본 -> 무장 (되돌리는 것 말고 답이 없다)
+    //   그 외  ssh 가 끊겼다. **상태를 모른다** -> 무장. 못 되돌리는 쪽이 더 나쁘다
+    const KNOWN = [0, 1, 2, 3, 4, 5];
+    if (r.code === 0 || r.code === 5 || !KNOWN.includes(r.code)) {
       // 경로는 이력으로 넘긴다 — 롤백이 폴더를 훑는 대신 이 값을 읽는다.
       vars.backup_path = backupPath;
-      this.engine.armRollback(`원격 백업 생성됨: ${backupPath}`);
-
-      console.log(`[RemoteDeploy] Step 5: ${tempPath} -> ${livePath}`);
-      ssh(`move ${tempPath} ${livePath}`);
-    } catch (err) {
-      console.error(`[RemoteDeploy] 스왑 실패 - 되돌립니다: ${err.message}`);
-      this.#rollbackSwap(ssh, { swapped, deployPath: livePath, backupPath });
-      if (manageIis) {
-        // 배포는 실패해도 서비스는 세워두고 나간다.
-        try { this.#iis(ssh, 'start', siteName); } catch { /* 무시 */ }
-      }
-      throw err;
+      this.engine.armRollback(`원격 백업: ${backupPath} (deploy.bat 종료코드 ${r.code})`);
     }
 
-    // 6. IIS 시작
-    if (manageIis) {
-      console.log(`[RemoteDeploy] Step 6: Starting IIS`);
-      this.#iis(ssh, 'start', siteName);
+    if (r.code !== 0) {
+      const why = reasonFor(DEPLOY, r.code);
+      console.error(`\n[RemoteDeploy] 배포 실패 - ${siteName}`);
+      console.error(`  사유     : ${why}`);
+      console.error(`  종료코드 : ${r.code}`);
+      if (r.code === 5) {
+        // 스크립트가 원복까지 실패한 자리. 사람이 칠 명령을 그대로 적어 준다.
+        console.error(`  ⚠️ 라이브 폴더가 없습니다. 원격에서 직접 실행하십시오:`);
+        console.error(`     move ${backupPath} ${livePath}`);
+      }
+      throw new Error(`원격 배포 실패: ${why} (종료코드 ${r.code})`);
     }
 
     // 7. 원격 백업 정리. 로컬과 같은 정책(`backup.keep_count`)을 쓴다.
@@ -289,52 +358,11 @@ class RemoteDeployMacroStage extends BaseStage {
     return paths.map((_, i) => ticksToEpochMs(lines[i]));
   }
 
-  /** 원격 명령 실행기. 포트·키를 매번 붙이지 않도록 감싼다. */
-  #sshRunner({ target, port, keyPath, basePath }) {
-    const sshPort = port ? `-p ${port}` : '';           // ssh 는 소문자 -p
-    const keyArg = keyPath ? `-i "${keyPath}"` : '';
-    return (remoteCmd, opts = {}) => {
-      const cmd = `ssh ${sshPort} -o StrictHostKeyChecking=no ${keyArg} ${target} "${remoteCmd}"`;
-      console.log(`  [ssh] ${remoteCmd}`);
-      return this.engine.runCommand(cmd, basePath, opts);
-    };
+  /** 원격 명령 실행기. 구현은 sshRunner.js 한 곳에 있다 (롤백 매크로와 공유). */
+  #sshRunner(opts) {
+    return makeSshRunner(this.engine, opts);
   }
 
-  /**
-   * 원격 IIS 제어. appcmd 는 "이미 그 상태" 일 때도 0 이 아닌 코드를 내므로
-   * 실패를 그대로 던지지 않고 출력을 보고 가른다 — IisControlStage 와 같은 판단이다.
-   */
-  #iis(ssh, action, site) {
-    const appcmd = '%windir%\\system32\\inetsrv\\appcmd.exe';
-    for (const [kind, name] of [['site', 'site.name'], ['apppool', 'apppool.name']]) {
-      const r = ssh(`${appcmd} ${action} ${kind} /${name}:${site}`, { capture: true, allowFailure: true });
-      if (r.code === 0) {
-        console.log(`  [iis] OK - ${action} ${kind} ${site}`);
-        continue;
-      }
-      const out = (r.output || '').trim();
-      if (/already (started|stopped)|ALREADY_(STARTED|STOPPED)/i.test(out)) {
-        console.log(`  [iis] 이미 원하는 상태 - ${kind} ${site}`);
-        continue;
-      }
-      console.error(`  [iis] 실패 - ${action} ${kind} ${site} (code=${r.code})`);
-      if (out) console.error(`        ${out.split('\n').slice(0, 3).join('\n        ')}`);
-      throw new Error(`원격 IIS ${action} 실패: ${kind} ${site}`);
-    }
-  }
-
-  /** 스왑 중 실패했을 때 라이브 폴더를 되살린다. */
-  #rollbackSwap(ssh, { swapped, deployPath, backupPath }) {
-    if (!swapped) return;   // 아직 옮기지 않았다면 라이브는 그대로다
-    try {
-      ssh(`if not exist ${deployPath} move ${backupPath} ${deployPath}`);
-      console.log(`  [rollback] 라이브 폴더를 백업에서 되살렸습니다.`);
-    } catch (err) {
-      // 여기서 실패하면 사람이 개입해야 한다. 경로를 정확히 남긴다.
-      console.error(`  [rollback] 자동 복구 실패. 원격에서 직접 실행하십시오:`);
-      console.error(`             move ${backupPath} ${deployPath}`);
-    }
-  }
 }
 
 module.exports = RemoteDeployMacroStage;

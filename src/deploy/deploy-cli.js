@@ -132,19 +132,24 @@ function openState(args, doc, environment) {
   } catch (err) {
     if (needsState) throw err;
     console.log(`[state] 설정을 찾지 못해 상태 기록 없이 진행합니다: ${err.message.split('\n')[0]}`);
-    return null;
+    return { state: null, config: null };
   }
 
   const statePath = resolveStatePath(config, args.yamlFile);
   const base = path.basename(statePath, '.json');
   const lockPath = path.join(path.dirname(statePath), `${base}.${environment}.lock`);
 
-  return new DeployState({
-    statePath,
-    lockPath,
-    keep: config.get('deploy.state_keep', 10),
-    ttlMinutes: config.get('deploy.lock_ttl_min', 60)
-  });
+  // config 를 함께 돌려준다 — 공지(텔레그램) 설정이 여기 들어 있고,
+  // 엔진은 자기가 설정을 읽지 않는다(부르는 쪽이 넘긴다).
+  return {
+    state: new DeployState({
+      statePath,
+      lockPath,
+      keep: config.get('deploy.state_keep', 10),
+      ttlMinutes: config.get('deploy.lock_ttl_min', 60)
+    }),
+    config
+  };
 }
 
 async function main() {
@@ -173,9 +178,9 @@ async function main() {
     process.exit(1);
   }
 
-  let state;
+  let state, deployConfig;
   try {
-    state = openState(args, doc, environment);
+    ({ state, config: deployConfig } = openState(args, doc, environment));
   } catch (err) {
     console.error(`[state] ${err.message}`);
     process.exit(1);
@@ -288,7 +293,8 @@ async function main() {
       dryRun: args.dryRun,
       only: args.only,
       deployKey,
-      state
+      state,
+      config: deployConfig
     });
 
     // 실행이 아직 running 이면 다음 그룹이 남았다는 뜻이라 락을 유지한다.

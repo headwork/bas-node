@@ -1,8 +1,9 @@
 const BaseStage = require('./BaseStage');
-const IisControlStage = require('./IisControlStage');
-const FsRenameStage = require('./FsRenameStage');
-const { applyRetention, stampNow } = require('../backupRetention');
+const { applyRetention, backupName, uniquePath } = require('../backupRetention');
 const { decideConfigSource, formatDecision } = require('../configPreserve');
+const { DEPLOY, reasonFor } = require('../scriptExit');
+const { joinPreserve } = require('../scriptArgs');
+const { assertScript, defaultScriptDir } = require('../scriptSync');
 const path = require('path');
 const fs = require('fs');
 
@@ -35,37 +36,49 @@ class LocalDeployMacroStage extends BaseStage {
     // 유추는 "폴더명 = 사이트명 = 앱풀명" 이라는 관행에 기대고 있다. 그 관행이 깨지면
     // 없는 사이트를 찾다 실패하거나 — 더 나쁘게 — 같은 이름의 다른 사이트를 멈춘다.
     // 배포 경로만 바꾸고 IIS 는 그대로 두는 경우가 실제로 있으므로 명시 경로를 연다.
-    const siteName =
-      this.engine.context.variables.iis_site || stageConfig.iis_site || path.basename(deployPath);
-    const siteSource =
-      (this.engine.context.variables.iis_site || stageConfig.iis_site) ? '명시' : 'web_deploy_path 에서 유추';
+    const vars = this.engine.context.variables;
+    const named = vars.web_server_name || stageConfig.web_server_name || vars.iis_site || stageConfig.iis_site;
+    const siteName = named || path.basename(deployPath);
+    const siteSource = named ? '명시' : 'web_deploy_path 에서 유추';
+
+    // 웹서버 종류. 없으면 iis 로 본다 — 지금까지 이 도구가 다룬 것이 IIS 뿐이라
+    // 기존 YAML 이 수정 없이 그대로 돌아야 한다 (#P002-REQ5).
+    const wsType = vars.web_server_type || stageConfig.web_server_type || 'iis';
+    // 공용 스크립트 자리. tool_home 은 PipelineEngine 이 주입한다.
+    const scriptDir = vars.script_dir || stageConfig.script_dir || defaultScriptDir(vars);
     // 백업은 `backup_root` 에 모은다. 지정하지 않으면 예전처럼 라이브 옆에 만든다.
     //
     // ⚠️ backup_root 는 **라이브와 같은 볼륨**이어야 한다. rename 이 즉시 끝나는 것은
     //    같은 볼륨 안에서뿐이고, 다른 볼륨이면 690MB 복사가 IIS 정지 구간에 들어간다.
     const backupRoot = this.engine.context.variables.backup_root || stageConfig.backup_root || null;
-    const backupName = `${path.basename(deployPath)}_backup_${stampNow()}`;
+    const backupDir = backupName(deployPath);
     if (backupRoot && !fs.existsSync(backupRoot)) {
       fs.mkdirSync(backupRoot, { recursive: true });
       console.log(`[LocalDeployMacroStage] 백업 폴더를 만들었습니다: ${backupRoot}`);
     }
-    const backupPath = backupRoot ? path.join(backupRoot, backupName) : `${deployPath}_backup_${stampNow()}`;
+    // 겹치면 스크립트가 `1` 로 거부한다(move 는 기존 폴더 **안으로** 들어가 성공한
+    // 것처럼 보이므로 옳은 태도다). 같은 초에 두 번 배포하면 실제로 겹치므로 비켜 간다.
+    const backupPath = uniquePath(
+      backupRoot ? path.join(backupRoot, backupDir) : path.join(path.dirname(deployPath), backupDir));
     const tempPath = `${deployPath}_temp_deploy`;
 
     console.log(`\n[LocalDeployMacroStage] Starting automated local deployment...`);
-    console.log(`- IIS Site Name: ${siteName} (${siteSource})`);
+    console.log(`- Web Server: ${siteName} (${siteSource}, type=${wsType})`);
     console.log(`- Target Deploy Path: ${deployPath}`);
     console.log(`- Backup Path: ${backupPath}`);
 
-    const iisStage = new IisControlStage(this.engine);
-    const renameStage = new FsRenameStage(this.engine);
-
     try {
-      await this.deploy({ iisStage, renameStage, deployPath, buildPath, tempPath, backupPath, backupRoot, siteName, basePath, stageConfig });
+      await this.deploy({
+        deployPath, buildPath, tempPath, backupPath, backupRoot,
+        siteName, wsType, scriptDir, basePath, stageConfig
+      });
     } catch (err) {
       // 스왑 전에 실패하면 temp 사본이 통째로 남는다(수백 MB). 치우고 나간다.
       // 스왑 후라면 tempPath 는 이미 live 로 이름이 바뀌어 존재하지 않으므로 안전하다.
-      if (fs.existsSync(tempPath)) {
+      //
+      // ⚠️ 종료코드 5(라이브 없음)일 때는 **아무것도 치우지 않는다.** 사람이 손으로
+      //    고쳐야 하는 자리이고, 그 사람이 볼 것을 치워 버리면 안 된다.
+      if (!err.keepEvidence && fs.existsSync(tempPath)) {
         console.log(`[LocalDeployMacroStage] 실패 - 임시 배포본 정리: ${tempPath}`);
         try {
           fs.rmSync(tempPath, { recursive: true, force: true });
@@ -77,13 +90,16 @@ class LocalDeployMacroStage extends BaseStage {
     }
   }
 
-  async deploy({ iisStage, renameStage, deployPath, buildPath, tempPath, backupPath, backupRoot, siteName, basePath, stageConfig }) {
+  async deploy({ deployPath, buildPath, tempPath, backupPath, backupRoot, siteName, wsType, scriptDir, basePath, stageConfig }) {
     const manageIis = !(stageConfig && stageConfig.manage_iis === false);
     // 이 서버의 설정 파일. 라이브의 것을 새 배포본으로 옮긴다.
     const preserveConfig = (stageConfig && stageConfig.preserve_config) || this.engine.context.preserveConfig || [];
     const configBackup = (stageConfig && stageConfig.config_backup) || this.engine.context.variables.config_backup || null;
     // 운영 중 생성되어 배포 뒤에도 유지해야 하는 항목 (폴더·파일 모두 가능)
     const preserve = (stageConfig && stageConfig.preserve) || this.engine.context.preserve || [];
+    // 어댑터가 해석하는 값. deploy.bat 은 모르고 그대로 상속시킨다 (IIS 의 앱풀 등).
+    const wsPool = this.engine.context.variables.web_server_pool
+      || (stageConfig && stageConfig.web_server_pool);
 
     // 1. Copy build output to temp path (to avoid blocking the rename later)
     console.log(`[LocalDeployMacroStage] Step 1: Copying build artifacts to temp directory`);
@@ -136,80 +152,78 @@ class LocalDeployMacroStage extends BaseStage {
       }
     }
 
-    // 2. Stop IIS
-    //    manage_iis: false 로 두면 IIS 제어를 건너뛴다. IIS 가 아닌 대상이거나
-    //    파일 교체만 확인하려는 경우에 쓴다. 기본값은 제어함(true)이다 —
-    //    서비스를 세우지 않고 파일을 갈아치우는 것이 기본값이어서는 안 된다.
-    if (manageIis) {
-      console.log(`[LocalDeployMacroStage] Step 2: Stopping IIS Service`);
-      await iisStage.execute({ action: 'stop', site: siteName }, basePath);
-    } else {
-      console.log(`[LocalDeployMacroStage] Step 2: IIS 제어 건너뜀 (manage_iis: false)`);
-    }
+    // 2. 정지 → 백업 → preserve → 스왑 → 시작. **스크립트 한 번이다** (#P002-TASK7).
+    //
+    //    예전에는 이 자리가 Node 코드 다섯 토막이었다. 원격은 그것이 ssh 왕복 다섯 번이라
+    //    라이브가 비는 구간이 벌어지는 문제가 있었고, 로컬은 그 문제가 없다 —
+    //    **그래서 로컬만 남겨 두면 스왑 순서가 두 곳에 살게 된다.**
+    //    한쪽만 고쳐지는 날이 오고, 그것이 이 과제가 없애려는 바로 그 병이다.
+    //
+    //    로컬에서만 다른 것 둘:
+    //      · 경로를 따옴표로 감싼다 — 로컬에는 공백 든 경로가 실제로 있다
+    //      · 값을 `set` 체인이 아니라 **자식 프로세스 환경변수**로 넘긴다.
+    //        그래서 공백 제약이 없다 (원격은 ssh 인용 때문에 못 쓴다)
+    const script = path.join(scriptDir, 'deploy.bat');
+    assertScript(script, scriptDir);
 
-    // 3. Rename existing live to backup
-    console.log(`[LocalDeployMacroStage] Step 3: Backing up live directory`);
-    await renameStage.execute({ src: deployPath, dest: backupPath }, basePath);
+    console.log(`[LocalDeployMacroStage] Step 2: 정지 -> 백업 -> 스왑 -> 시작 (deploy.bat)`);
+    console.log(`  live   ${deployPath}`);
+    console.log(`  staged ${tempPath}`);
+    console.log(`  backup ${backupPath}`);
+    if (preserve.length > 0) console.log(`  preserve ${preserve.join(', ')}`);
 
-    // 여기서부터 라이브가 비어 있다. 이 지점을 지난 실패만 롤백 대상이다.
-    // 백업이 실제로 생겼는지 확인하고 무장한다 — 되돌릴 대상이 없는데 무장하면
-    // 롤백이 라이브를 _failed_ 로 밀어내고 복구는 못 하는 최악이 된다.
-    if (fs.existsSync(backupPath)) {
+    // 계약에 있는 키는 **하나도 빠짐없이 적는다.** 빈 값은 Windows 에서 변수 삭제다 —
+    // 빠뜨리면 부모 프로세스(젠킨스)에 같은 이름이 있을 때 그 값이 그대로 흘러든다.
+    // `WS_SKIP` 하나가 새어 들어오면 웹서버를 세우지 않고 폴더만 갈아치운다.
+    const r = this.engine.runCommand(`"${script}"`, basePath, {
+      capture: true,
+      allowFailure: true,
+      env: {
+        DP_LIVE: deployPath,
+        DP_STAGED: tempPath,
+        DP_BACKUP: backupPath,
+        DP_BACKUP_ROOT: backupRoot || '',
+        // 운영 중 생성된 항목(EDMS · Temp 등). 스크립트가 **정지한 뒤에** 옮긴다 —
+        // 서비스가 살아 있으면 파일이 쓰이는 중이라 사본이 깨진다.
+        DP_PRESERVE: joinPreserve(preserve),
+        WS_SKIP: manageIis ? '' : '1',
+        WS_TYPE: manageIis ? wsType : '',
+        WS_NAME: manageIis ? siteName : '',
+        WS_POOL: (manageIis && wsPool) ? wsPool : ''
+      }
+    });
+
+    const out = (r.output || '').trim();
+    if (out) out.split(/\r?\n/).forEach(line => console.log(`  ${line}`));
+
+    // 무장 여부는 종료코드가 정한다. 원격과 **같은 표**를 쓴다 (scriptExit.js).
+    // 예전에는 `fs.existsSync(backupPath)` 로 확인했는데, 이제 그 중간 지점을
+    // Node 가 보지 못한다 — 대신 스크립트가 코드로 말해 준다.
+    const KNOWN = [0, 1, 2, 3, 4, 5];
+    if (r.code === 0 || r.code === 5 || !KNOWN.includes(r.code)) {
       // 이력에 남긴다. 롤백은 폴더를 훑는 대신 이 경로를 읽는다.
       this.engine.context.variables.backup_path = backupPath;
-      this.engine.armRollback(`백업 생성됨: ${path.basename(backupPath)}`);
-    } else {
-      console.error(`[LocalDeployMacroStage] 경고: 백업 경로가 없습니다 (${backupPath}). 롤백을 무장하지 않습니다.`);
+      this.engine.armRollback(`백업 생성됨: ${path.basename(backupPath)} (deploy.bat 종료코드 ${r.code})`);
     }
 
-    // 3.5 운영 중 생성된 항목을 새 배포본으로 가져온다 (EDMS · Temp · 운영 web.config 등)
-    //
-    //   서버를 내린 뒤에 한다. 서비스가 살아 있으면 파일이 쓰이는 중이라 사본이 깨진다.
-    //   스왑 전에 temp 로 옮겨 놓으므로 라이브는 이름 변경 한 번으로 완성된다.
-    //   config_dir(Step 1.5)로 넣은 파일과 겹치면 이쪽이 이긴다 — 운영본이 우선이다.
-    if (preserve.length > 0) {
-      console.log(`[LocalDeployMacroStage] Step 3.5: Preserving ${preserve.length} item(s) from previous deployment`);
-      const startedAt = Date.now();
-
-      for (const name of preserve) {
-        const from = path.join(backupPath, name);
-        const to = path.join(tempPath, name);
-
-        if (!fs.existsSync(from)) {
-          // 최초 배포에는 없는 것이 정상이다. 실패시키지 않되 조용히 넘기지도 않는다.
-          console.log(`  [preserve] ${name} - 이전 배포본에 없음 (건너뜀)`);
-          continue;
-        }
-
-        const stat = fs.statSync(from);
-        if (stat.isDirectory()) {
-          fs.cpSync(from, to, { recursive: true, force: true });
-          const count = countFiles(to);
-          console.log(`  [preserve] ${name}/ (${count}개 파일)`);
-        } else {
-          fs.copyFileSync(from, to);
-          console.log(`  [preserve] ${name} (${stat.size}B)`);
-        }
+    if (r.code !== 0) {
+      const why = reasonFor(DEPLOY, r.code);
+      console.error(`\n[LocalDeployMacroStage] 배포 실패 - ${siteName}`);
+      console.error(`  사유     : ${why}`);
+      console.error(`  종료코드 : ${r.code}`);
+      const err = new Error(`로컬 배포 실패: ${why} (종료코드 ${r.code})`);
+      if (r.code === 5) {
+        console.error(`  ⚠️ 라이브 폴더가 없습니다. 직접 실행하십시오:`);
+        console.error(`     move "${backupPath}" "${deployPath}"`);
+        // 사람이 볼 것을 치우지 않는다 (바깥 catch 가 읽는다)
+        err.keepEvidence = true;
       }
-
-      console.log(`  보존 소요 ${((Date.now() - startedAt) / 1000).toFixed(1)}초`);
+      throw err;
     }
 
-    // 4. Rename temp to live
-    console.log(`[LocalDeployMacroStage] Step 4: Swapping temp to live`);
-    await renameStage.execute({ src: tempPath, dest: deployPath }, basePath);
-
-    // 5. Start IIS
-    if (manageIis) {
-      console.log(`[LocalDeployMacroStage] Step 5: Starting IIS Service`);
-      await iisStage.execute({ action: 'start', site: siteName }, basePath);
-    } else {
-      console.log(`[LocalDeployMacroStage] Step 5: IIS 제어 건너뜀 (manage_iis: false)`);
-    }
-
-    // 6. 백업 보관 정책 적용 (#P001-OQ2)
+    // 3. 백업 보관 정책 적용 (#P001-OQ2)
     //    정리 실패는 배포 성공을 뒤집지 않는다 — 로그만 남기고 넘어간다.
-    console.log(`[LocalDeployMacroStage] Step 6: Applying backup retention policy`);
+    console.log(`[LocalDeployMacroStage] Step 3: Applying backup retention policy`);
     try {
       const retentionConfig = {
         ...(this.engine.context.backup || {}),
@@ -222,15 +236,6 @@ class LocalDeployMacroStage extends BaseStage {
 
     console.log(`[LocalDeployMacroStage] Automated deployment completed successfully.`);
   }
-}
-
-function countFiles(dir) {
-  let count = 0;
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    if (entry.isDirectory()) count += countFiles(path.join(dir, entry.name));
-    else count++;
-  }
-  return count;
 }
 
 module.exports = LocalDeployMacroStage;

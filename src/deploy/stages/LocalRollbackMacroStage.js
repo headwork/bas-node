@@ -1,7 +1,7 @@
 const BaseStage = require('./BaseStage');
-const IisControlStage = require('./IisControlStage');
-const FsRenameStage = require('./FsRenameStage');
-const { listBackups, stampNow } = require('../backupRetention');
+const { listBackups, backupName, stampNow, uniquePath } = require('../backupRetention');
+const { ROLLBACK, reasonFor } = require('../scriptExit');
+const { assertScript, defaultScriptDir } = require('../scriptSync');
 const path = require('path');
 const fs = require('fs');
 
@@ -35,8 +35,12 @@ class LocalRollbackMacroStage extends BaseStage {
 
     // local_deploy 와 반드시 같은 사이트를 잡아야 한다. 여기서만 다른 이름이 나오면
     // 배포는 멈춘 사이트를 롤백이 못 세운다. 우선순위를 local_deploy 와 맞춰 둔다.
-    const siteName = config.site || vars.iis_site || config.iis_site || path.basename(deployPath);
-    const manageIis = config.manage_iis !== false;
+    const siteName = config.site || vars.web_server_name || config.web_server_name
+      || vars.iis_site || config.iis_site || path.basename(deployPath);
+    // 기존 YAML 이 수정 없이 돌아야 한다 (#P002-REQ5).
+    const wsType = vars.web_server_type || config.web_server_type || 'iis';
+    const scriptDir = vars.script_dir || config.script_dir || defaultScriptDir(vars);
+    const manageIis = config.manage_iis !== false && (vars.web_server_type || config.web_server_type) !== 'none';
 
     const target = this.#pickBackup(config, deployPath);
     if (!target) return;   // 되돌릴 변경이 없다 (사유는 #pickBackup 이 출력한다)
@@ -45,57 +49,74 @@ class LocalRollbackMacroStage extends BaseStage {
     console.log(`[LocalRollback] Restoring ${siteName} from ${path.basename(target.path)}` +
       ` (${keepBackup ? '백업 보존' : '백업 소비'})`);
 
-    const iisStage = new IisControlStage(this.engine);
-    const renameStage = new FsRenameStage(this.engine);
+    // 현재 라이브를 치워 둘 자리.
+    //   파이프라인 실패로 도는 경우는 그 배포본이 원인이므로 `_failed_` 로 격리한다.
+    //   사람이 부른 강제 롤백은 실패한 것이 아니므로 백업 이름으로 남긴다 —
+    //   그래야 "되돌렸다가 다시 최신으로" 가 가능하다. **이것이 Node 의 판단이다.**
+    //
+    //   ⚠️ 타임스탬프가 초 단위라 **같은 초에 배포하고 되돌리면 이름이 겹친다.**
+    //      스크립트는 겹치면 거부하므로(옳다) Node 가 비켜 간 이름을 준다.
+    const stamp = stampNow();
+    const asidePath = uniquePath(keepBackup
+      ? path.join(target.root || path.dirname(deployPath), backupName(deployPath, stamp))
+      : path.join(path.dirname(deployPath), `${path.basename(deployPath)}_failed_${stamp}`));
 
-    // 1. 강제 롤백이면 **서비스가 살아 있는 동안** 복사부터 끝낸다.
-    //    정지 구간에 690MB 복사를 넣으면 그만큼 서비스가 죽어 있게 된다.
-    let source = target.path;
-    if (keepBackup) {
-      source = `${deployPath}_rollback_temp`;
-      if (fs.existsSync(source)) fs.rmSync(source, { recursive: true, force: true });
-      console.log(`[LocalRollback] Step 0: 백업을 복사합니다 -> ${path.basename(source)}`);
-      const startedAt = Date.now();
-      fs.cpSync(target.path, source, { recursive: true });
-      console.log(`[LocalRollback]   복사 소요 ${((Date.now() - startedAt) / 1000).toFixed(1)}초`);
+    // 복사 → 정지 → 치우기 → 복귀 → 시작. **스크립트 한 번이다** (#P002-TASK7).
+    // 원격과 같은 스크립트, 같은 종료코드 표를 쓴다 — 다른 것은 호출 경로뿐이다.
+    const script = path.join(scriptDir, 'rollback.bat');
+    assertScript(script, scriptDir);
+    const scratch = `${deployPath}_rollback_temp`;
+
+    // 남아 있는 스크래치를 먼저 치운다. **스크립트는 이미 있으면 거부한다**(exit 1) —
+    // 덮어쓰면 반쪽짜리 사본이 라이브가 될 수 있으니 옳은 태도다. 다만 그 판단,
+    // "이건 우리가 만든 찌꺼기고 지워도 된다" 는 Node 가 한다.
+    // 안 치우면 롤백이 영영 막힌다 — 하필 비상용 경로에서.
+    if (keepBackup && fs.existsSync(scratch)) {
+      console.log(`[LocalRollback] 이전 롤백이 남긴 임시 사본을 지웁니다: ${path.basename(scratch)}`);
+      fs.rmSync(scratch, { recursive: true, force: true });
     }
 
-    try {
-      // 2. IIS 정지
-      if (manageIis) {
-        console.log(`[LocalRollback] Step 1: Stopping IIS Service`);
-        await iisStage.execute({ action: 'stop', site: siteName }, basePath);
-      }
+    console.log(`  live   ${deployPath}`);
+    console.log(`  source ${target.path}`);
+    console.log(`  aside  ${asidePath}`);
 
-      // 3. 지금 라이브를 치워 둔다.
-      //    파이프라인 실패로 도는 경우는 그 배포본이 원인이므로 `_failed_` 로 격리한다.
-      //    사람이 부른 강제 롤백은 실패한 것이 아니므로 `_backup_` 으로 남긴다 —
-      //    그래야 "되돌렸다가 다시 최신으로" 가 가능하다.
-      if (fs.existsSync(deployPath)) {
-        const asideName = keepBackup
-          ? `${path.basename(deployPath)}_backup_${stampNow()}`
-          : `${path.basename(deployPath)}_failed_${stampNow()}`;
-        const asideDir = keepBackup ? (target.root || path.dirname(deployPath)) : path.dirname(deployPath);
-        const asidePath = path.join(asideDir, asideName);
-        console.log(`[LocalRollback] Step 2: 현재 라이브를 치웁니다 -> ${asideName}`);
-        await renameStage.execute({ src: deployPath, dest: asidePath }, basePath);
-      } else {
-        console.log(`[LocalRollback] Step 2: 라이브 경로가 없습니다 (스왑 도중 실패). 치울 것이 없습니다.`);
+    const r = this.engine.runCommand(`"${script}"`, basePath, {
+      capture: true,
+      allowFailure: true,
+      env: {
+        RB_LIVE: deployPath,
+        RB_SOURCE: target.path,
+        RB_ASIDE: asidePath,
+        RB_MODE: keepBackup ? 'copy' : 'consume',
+        // 강제 롤백은 **서비스가 살아 있는 동안** 복제부터 끝낸다.
+        // 정지 구간에 690MB 복사를 넣으면 그만큼 서비스가 죽어 있게 된다.
+        RB_TEMP: keepBackup ? scratch : '',
+        WS_SKIP: manageIis ? '' : '1',
+        WS_TYPE: manageIis ? wsType : '',
+        WS_NAME: manageIis ? siteName : '',
+        WS_POOL: (manageIis && (vars.web_server_pool || config.web_server_pool))
+          ? (vars.web_server_pool || config.web_server_pool) : ''
       }
+    });
 
-      // 4. 준비한 것을 라이브로
-      console.log(`[LocalRollback] Step 3: Restoring backup to live path`);
-      await renameStage.execute({ src: source, dest: deployPath }, basePath);
-    } finally {
-      // 5. 배포는 실패해도 서비스는 세우고 나간다.
-      if (manageIis) {
-        console.log(`[LocalRollback] Step 4: Starting IIS Service`);
-        try { await iisStage.execute({ action: 'start', site: siteName }, basePath); } catch { /* 무시 */ }
+    const out = (r.output || '').trim();
+    if (out) out.split(/\r?\n/).forEach(line => console.log(`  ${line}`));
+
+    if (r.code !== 0) {
+      const why = reasonFor(ROLLBACK, r.code);
+      console.error(`\n[LocalRollback] 롤백 실패 - ${siteName}`);
+      console.error(`  사유     : ${why}`);
+      console.error(`  종료코드 : ${r.code}`);
+      if (r.code === 5) {
+        console.error(`  ⚠️ 라이브 폴더가 없습니다. 직접 실행하십시오:`);
+        console.error(`     move "${target.path}" "${deployPath}"`);
       }
+      throw new Error(`로컬 롤백 실패: ${why} (종료코드 ${r.code})`);
     }
 
+    // 소비된 백업은 다음 롤백 후보에서 빠져야 한다. **성공했을 때만** 표시한다 —
+    // 실패했는데 소비로 적으면 되돌릴 수 있는 지점이 이력에서 사라진다.
     if (target.runKey && !keepBackup && this.engine.deployState) {
-      // 소비된 백업은 다음 롤백 후보에서 빠져야 한다.
       try { this.engine.deployState.markBackupConsumed(target.runKey); } catch { /* 무시 */ }
     }
 

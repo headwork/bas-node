@@ -1,0 +1,216 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# 신규 프로젝트 배포 정의 샘플 (wesys 기준, 접속정보는 * 로 가림)
+#
+# 이 파일을 <프로젝트>.yaml 로 복사해서 값만 바꾼다.
+# 항목별 설명과 함정은 docs/design/배포/05_신규_프로젝트_설정.md 가 정본이다.
+#
+# 채우기 전에 두 가지를 먼저 정한다.
+#   1. 어디서 빌드하나        -> server_list 의 빌드서버 블록
+#   2. 어디에 배포하나        -> server_list 의 배포서버 블록
+# target 은 그 둘을 잇는 조합표일 뿐이다.
+# ─────────────────────────────────────────────────────────────────────────────
+name: "Deploy <프로젝트>"
+project: "<프로젝트키>"                     # config/<프로젝트키>.json 을 읽는다
+# 배포 공지 머리말. `[WESYS-QA]` 의 앞부분이다. 생략하면 project 를 대문자로 쓴다.
+# 보낼지 말지는 target 의 `telegram:` 이 정하고,
+# 어떻게 보낼지(젠킨스 잡 경유 여부·토큰·채팅방)는 config/<프로젝트키>.json 의 telegram 블록이 쥔다.
+notify_tag: "<공지태그>"
+# ⚠️ 인용에 주의한다. cmd 는 따옴표를 **구분자로 먹어** 값이 조용히 뭉개진다.
+#   O  --params="{\"environment\":\"qa\"}"
+#   X  --params={"environment":"qa"}      -> {environment:qa} 가 되어 Invalid JSON
+# 상세는 docs/design/배포/04_젠킨스_잡.md.
+environment: "dev"
+deploy_root: "D:/Deploy"
+
+# 웹서버 제어·배포 스크립트가 사는 자리. **생략해도 된다** —
+# 적지 않으면 배포도구(bas-deploy.js) 옆의 `script/windows` 를 본다.
+#
+# 여기 있는 것은 **공용 한 벌**이다(deploy.bat · webserver_<종류>.bat · rollback.bat).
+# 프로젝트마다 복사하지 않는다 — IIS 프로젝트가 열 개여도 webserver_iis.bat 은 하나다.
+# 프로젝트마다 다른 것(build_*.bat·pubxml)은 profile_dir 쪽에 둔다.
+#
+# 원격 배포는 이 폴더를 **배포서버로 매번 밀어 넣는다**(`${upload_path}/_scripts/windows`).
+# 배포서버에 손으로 올려 둘 필요가 없다. 규약은 docs/design/배포/06_배포_스크립트_규약.md.
+# script_dir: "${tool_home}/script/windows"
+# sync_scripts: false        # 배포서버에 직접 배치했을 때만 끈다. 기본은 전송함
+
+# ⚠️ URL 에 자격증명을 넣지 않는다. 젠킨스가 withCredentials 로 넣어 주는
+#    GIT_ASKPASS 가 git 의 프롬프트에 답한다.
+#    ${env.X} 는 미정의여도 에러 없이 빈 문자열이 되므로, 자격증명을 URL 에 두면
+#    "인증 실패" 외에는 아무 단서가 남지 않는다.
+git_url: "http://***.***.***.**:*****/<저장소>.git"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 서버 환경
+#     빌드 서버 : 소스폴더(git), 빌드폴더, 게시 프로파일, 빌드 명령
+#     배포 서버 : 웹서비스가 실행되는 서버, 접속정보, 업로드 경로, 라이브 폴더, IIS
+#
+# 참조는 YAML 앵커(`*이름`)로 한다 — 없는 이름을 쓰면 파서가 파싱 단계에서 죽는다.
+#
+# ⚠️ 블록 안에서 `name:` 을 쓰지 않는다. 이 키들은 전부 변수로 펼쳐지므로
+#    루트의 `name:` 을 덮어버린다 — 에러 없이, 로그에서만 티가 난다.
+# ─────────────────────────────────────────────────────────────────────────────
+server_list:
+  local: &local_jenkins
+    server_name: "local_jenkins"
+    source_path: "${deploy_root}/jenkins_home/workspace/<체크아웃폴더>"
+    build_root: "${deploy_root}/build"                # 산출물 루트. 폴더명은 target 이 붙인다
+    profile_dir: "D:/Deploy/jenkins/project_<프로젝트>"  # 빌드 스크립트·게시 프로파일 위치
+
+    # 빌드 명령은 빌드축이다 — "이 서버에서 이 프로젝트를 어떻게 짓는가".
+    # 환경마다 같으므로 target 세 곳에 복사하지 않는다(한 곳만 고쳐지는 날이 온다).
+    #
+    # 명령 자체는 **스크립트 파일**에 둔다. yaml 에는 무엇을 부르는지만 남는다 —
+    # 빌드 방식(dotnet·gradle·npm)이 바뀌어도 파이프라인은 그대로다.
+    #
+    # ⚠️ 산출물 경로(build_path)를 스크립트에 넘긴다. 게시 프로파일(pubxml)에도 같은
+    #    뜻의 PublishUrl 이 있어서, 두 곳이 어긋나면 에러 없이 갈린다 —
+    #    빌드 도구는 자기 설정대로 게시하고 파이프라인은 여기 적힌 곳을 보므로,
+    #    낡은 산출물이 새것인 척 배포된다.
+    #    스크립트가 프로파일 **사본**의 경로를 이 값으로 덮으면 정본이 yaml 하나가 된다.
+    build_cwd: "${source_path}/<프로젝트>/Web"
+    build_cmd: "\"${profile_dir}\\build_<프로젝트>.bat\" \"${build_profile}\" \"${build_path}\""
+
+    # 이 블록을 배포 대상으로도 쓸 때(dev) 필요한 값들.
+    web_deploy_path: "${deploy_root}/<라이브폴더>"     # 라이브 폴더 = IIS physicalPath
+    backup_root: "${deploy_root}/_backup"             # ⚠️ 라이브와 같은 볼륨이어야 한다
+    iis_site: "<IIS사이트명>"
+    health_url: "https://localhost:****/healthz"
+
+  qa_server: &qa_server
+    server_name: "qa_deploy"
+    # 접속정보. resolveServer 가 이 블록을 평평하게 펴서 스테이지에 넘긴다.
+    # 키 이름은 ssh config 문법(User·IdentityFile)이 아니라 user·key_path 다.
+    #
+    # user·key_path 를 생략하면 ~/.ssh/config 의 Host 항목을 따른다. 다만 그러면
+    # **설정이 저장소 밖에 있어** 서버를 옮길 때 같이 따라오지 않는다. 적어 두는 쪽을 권한다.
+    # ⚠️ key_path 는 배포도구가 도는 서버(젠킨스)의 **로컬 경로**다.
+    ssh:
+      host: "***.***.**.***"
+      port: ****
+      user: "<원격계정>"
+      key_path: "C:/Users/<계정>/.ssh/<키파일>"
+    upload_path: "D:/<업로드폴더>/build"          # 압축파일이 도착할 원격 폴더
+    web_deploy_path: "D:/Deploy/<라이브폴더>"      # 원격 라이브 폴더 = IIS physicalPath
+    backup_root: "D:/<업로드폴더>/backup"          # ⚠️ 라이브와 같은 볼륨이어야 한다
+    iis_site: "<IIS사이트명>"                      # 생략하면 web_deploy_path 끝 폴더명으로 유추
+    health_url: "https://****.***.co.kr/healthz"
+
+  prod_server: &prod_server
+    <<: *qa_server                               # 머지키는 server_list 에서만 동작한다
+    server_name: "prod_deploy"
+    web_deploy_path: "D:/Deploy/<운영라이브폴더>"
+    iis_site: "<운영IIS사이트명>"
+    health_url: "https://****.***.co.kr/healthz"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# target 은 조합표다 — 어느 빌드서버에서 만들어 어느 배포서버로 보낼지.
+# 여기 직접 적은 값이 서버 블록을 이긴다(부분 덮어쓰기).
+#
+# 엔진은 환경 이름(dev·qa·prod)을 보지 않는다. 갈래는 아래 설정값이 정한다.
+#   build_server    어디서 빌드하나
+#   deploy_server   어디에 배포하나 (로컬이든 원격이든 반드시 적는다)
+#   deploy_remote   true 면 원격접속해서 배포한다. 생략 시 true
+#   compress        생략 시 true. 원격 배포는 zip 하나로 보내므로 끌 수 없다
+#
+# ⚠️ target 블록에 머지키 `<<:` 를 쓰면 아무것도 병합되지 않고 에러도 나지 않는다.
+# ─────────────────────────────────────────────────────────────────────────────
+target:
+  dev:
+    branch: "<개발브랜치>"
+    build_server: *local_jenkins
+    build_path: "${build_root}/<산출물폴더>"
+    build_profile: "${profile_dir}/<프로파일>Dev.pubxml"
+
+    deploy_server: *local_jenkins
+    deploy_remote: false        # 이 서버 안에서 끝낸다
+    compress: false             # 로컬은 zip 을 쓰지 않는다 (대용량은 압축에만 수 분)
+    confluence: false
+    telegram: false
+
+  qa:
+    branch: "<QA브랜치>"
+    build_server: *local_jenkins
+    build_path: "${build_root}/<산출물폴더>"
+    build_profile: "${profile_dir}/<프로파일>QA.pubxml"
+
+    deploy_server: *qa_server
+    confluence: false
+    telegram: false
+
+  prod:
+    branch: "<운영브랜치>"
+    build_server: *local_jenkins
+    build_path: "${build_root}/<운영산출물폴더>"
+    build_profile: "${profile_dir}/<프로파일>Prod.pubxml"
+
+    deploy_server: *prod_server
+    confluence: false
+    telegram: true
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 서버 설정 보전
+#
+# 배포는 폴더를 통째로 갈아끼운다. 그냥 두면 소스에 든 설정이 서버 설정을 덮는다.
+#
+#   exclude          빌드가 끝나면 산출물에서 지운다. 소스 설정은 서버까지 가지도 않는다
+#   preserve_config  라이브의 설정을 새 배포본으로 옮긴다. 서비스 정지 **전**에 끝낸다
+#   config_backup    옮긴 설정의 사본을 두는 곳
+#
+# 규칙은 하나다 — **config_backup 의 파일이 라이브보다 최근이면 그쪽이 이긴다.**
+#   운영 중 서버에서 직접 수정   -> 라이브가 최근이므로 그대로 유지된다
+#   개발자가 config_backup 수정  -> 더 최근이므로 다음 배포가 가져간다
+#
+# ⚠️ 다른 PC 에서 복사해 온 파일은 수정시각이 과거라 안 들어간다. 오류가 아니라 규칙이다.
+# ⚠️ 배포는 설정 파일의 시각을 찍지 않는다. 찍으면 라이브가 언제나 최신이 되어 규칙이 죽는다.
+#
+# 목록의 파일이 라이브에도 config_backup 에도 없으면 배포를 실패시킨다 —
+# 설정 없는 배포본이 라이브가 되는 것보다 낫다. 최초 설치는 사람이 한 번 넣는다.
+# ─────────────────────────────────────────────────────────────────────────────
+exclude:
+  - "appsettings*.json"    # 산출물 루트만 본다. 하위 폴더는 훑지 않는다
+  - "web.config"
+
+preserve_config:
+  - "web.config"           # exclude 하지 않는다 - 없으면 IIS 가 500.19 로 뜬다
+  - "appsettings.json"
+
+config_backup: "${backup_root}/config/${environment}"
+
+# 백업 보관 정책. 배포 성공 직후 자동 적용된다 (로컬·원격 모두).
+# 이 개수가 곧 `--rollback=N` 의 N 상한이다 — 남기지 않은 것은 되돌릴 수 없다.
+#
+# ⚠️ 백업 폴더명은 라이브 폴더명에서 파생된다(<라이브명>_backup_<시각>).
+#    여러 파이프라인이 같은 backup_root 를 공유하면 서로의 백업을 정리 대상으로 본다.
+backup:
+  keep_count: 3
+  dry_run: false           # true 로 두면 삭제 대상만 출력하고 지우지 않는다
+
+# ─────────────────────────────────────────────────────────────────────────────
+# stages 에는 설정을 두지 않는다 — 순서 · 그룹 · 갈래만이다.
+# 경로·명령·주소는 전부 server_list / target 에서 온다.
+#
+# group 은 --only 로 나눠 실행할 단위다. 젠킨스가 그룹마다 따로 호출하면
+# 각 단계의 성공/실패가 stage view 에 그대로 보인다.
+# 같은 --deploy-key 를 넘겨야 앞 단계의 판정(changed_static_only 등)이 이어진다.
+# ─────────────────────────────────────────────────────────────────────────────
+stages:
+  - git_sync:      { group: git_check }                  # branch·source_path 를 읽어 동기화
+  - build:         { group: build }                      # build_cwd·build_cmd·build_profile
+  - archive:       { group: build,  if: compress }       # build_path -> _artifacts/<이름>.zip
+  - remote_deploy: { group: deploy, if: deploy_remote }  # scp -> 해제 -> 정지 -> 스왑 -> 시작
+  - health_check:  { group: deploy, if: deploy_remote }  # health_url
+  - local_deploy:  { group: deploy, unless: deploy_remote }
+  - confluence:    { group: deploy }                     # confluence: true 인 경우만 동작
+
+# 배포가 실패하면 실행된다. 백업 폴더로 라이브를 되돌린다.
+# 백업이 없으면(라이브를 건드리기 전에 실패) 아무것도 하지 않는다.
+#
+#   basDeploy.bat --yaml=... --rollback=1     1 = 직전 성공 배포 (최대 backup.keep_count)
+#   basDeploy.bat --yaml=... --rollback=1 --dry-run    되돌릴 후보만 출력
+rollback:
+  - local_rollback:  { unless: deploy_remote }
+  - remote_rollback: { if: deploy_remote }

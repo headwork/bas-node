@@ -2,10 +2,24 @@ const fs = require('fs');
 const path = require('path');
 const yaml = require('js-yaml');
 const child_process = require('child_process');
+
+/**
+ * 배포 도구가 놓인 폴더. (#P202609_002 [D10])
+ *
+ * `__dirname` 을 쓰지 않는다 — webpack 번들에서는 그 값이 무엇을 가리킬지 빌드 설정에 달렸다.
+ * 실행된 진입점(`process.argv[1]`)은 번들이든 소스든 항상 실제 파일이다.
+ *
+ * ⚠️ `basDeploy.bat` 이 자기 폴더로 cd 하지만 **그 동작에 기대지 않는다** —
+ *    `04_젠킨스_잡.md` 가 "런처를 고치면 조용히 깨진다"고 적어 둔 그 의존이다.
+ */
+function resolveToolHome() {
+  const entry = process.argv[1];
+  return entry ? path.dirname(path.resolve(entry)) : process.cwd();
+}
 const CommandStage = require('./stages/CommandStage');
 const ChainStage = require('./stages/ChainStage');
 const ExtractStage = require('./stages/ExtractStage');
-const IisControlStage = require('./stages/IisControlStage');
+const ScriptControlStage = require('./stages/ScriptControlStage');
 const FsRenameStage = require('./stages/FsRenameStage');
 const SyncStaticStage = require('./stages/SyncStaticStage');
 const HealthCheckStage = require('./stages/HealthCheckStage');
@@ -22,6 +36,7 @@ const OtherServerStage = require('./stages/OtherServerStage');
 const RemoteDeployMacroStage = require('./stages/RemoteDeployMacroStage');
 const RemoteRollbackMacroStage = require('./stages/RemoteRollbackMacroStage');
 const ConfluenceStage = require('./stages/ConfluenceStage');
+const notify = require('./notify');
 
 class PipelineEngine {
   constructor(initialParams = {}) {
@@ -45,7 +60,10 @@ class PipelineEngine {
       'upload': new CommandStage(this),
       'chain_call': new ChainStage(this),
       'extract': new ExtractStage(this),
-      'iis_control': new IisControlStage(this),
+      // 이름에 웹서버 종류를 박지 않는다. 무엇을 제어할지는 `web_server_type` 이 정한다.
+      'web_server_control': new ScriptControlStage(this),
+      // 구명 별칭. 기존 YAML 이 수정 없이 그대로 돌아야 한다 (#P002-REQ5).
+      'iis_control': new ScriptControlStage(this),
       'fs_rename': new FsRenameStage(this),
       'sync_static': new SyncStaticStage(this),
       'health_check': new HealthCheckStage(this),
@@ -260,9 +278,25 @@ class PipelineEngine {
 
   async run(yamlPath, overrideParams = {}, options = {}) {
     console.log(`[Pipeline] Starting pipeline from ${yamlPath}...`);
+    // 공지(텔레그램) 설정이 여기 들어 있다. 엔진은 설정 파일을 직접 읽지 않는다 —
+    // 어느 프로젝트 설정을 쓸지는 CLI 가 정하고, 엔진은 받은 것만 쓴다.
+    this.config = options.config || null;
     const doc = this.loadYaml(yamlPath);
     const { secretKeys } = this.prepareContext(doc, overrideParams, options);
     return this.#runStages(doc, yamlPath, secretKeys, options);
+  }
+
+  /**
+   * 배포 공지. **실패해도 배포 결과를 바꾸지 않는다.**
+   * 공지가 안 갔다고 성공한 배포를 실패로 만들 이유가 없고,
+   * 실패 통지가 또 실패해서 원래 에러를 덮으면 원인을 잃는다.
+   */
+  async #announce({ state, key, status, group, error, dryRun }) {
+    try {
+      await notify.announce(this, { state, key, status, group, error, dryRun });
+    } catch (err) {
+      console.log(`[Notify] 경고: 공지 처리 중 오류 - ${err.message}`);
+    }
   }
 
   /**
@@ -411,6 +445,9 @@ class PipelineEngine {
 
     // 5. 최종 병합 — 외부 파라미터가 끝까지 최우선이다.
     this.context.variables = {
+      // 배포 도구가 놓인 폴더. 공용 스크립트(deploy.bat·webserver_*.bat)가 그 아래 산다.
+      // **맨 앞에 둔다** — yaml 이 `tool_home` 을 적으면 그쪽이 이긴다.
+      tool_home: resolveToolHome(),
       ...baseVars,
       ...buildVars,
       ...deployVars,
@@ -455,6 +492,9 @@ class PipelineEngine {
 
     if (options.dryRun) {
       this.printPlan(doc, secretKeys, plan);
+      // 공지 문안도 함께 보여 준다 — 태그·환경이 맞는지 여기서 확인한다.
+      // 변경 목록은 git_sync 가 돌지 않았으므로 비어 있는 것이 정상이다.
+      await this.#announce({ status: 'success', dryRun: true });
       return;
     }
 
@@ -515,6 +555,11 @@ class PipelineEngine {
         if (!options.only || options.only === plan.lastGroup) state.finish(key, 'success');
       }
 
+      // 공지도 마지막 그룹에서만. 그룹마다 보내면 배포 한 번에 세 번 울린다.
+      if (!options.only || options.only === plan.lastGroup) {
+        await this.#announce({ state, key, status: 'success' });
+      }
+
       console.log(`[Pipeline] Pipeline finished successfully.`);
       return { cancelled: false };
     } catch (err) {
@@ -526,6 +571,9 @@ class PipelineEngine {
         });
         state.finish(key, 'failed', err.message);
       }
+      // 롤백보다 먼저 보낸다 — 롤백이 길어지면 통지가 그만큼 늦는다.
+      // 어느 그룹에서 깨졌든 한 번은 알린다(announced 표식이 중복을 막는다).
+      await this.#announce({ state, key, status: 'failed', group: groupLabel, error: err.message });
       await this.executeRollback(doc, basePath);
       throw err;
     }
@@ -786,9 +834,18 @@ class PipelineEngine {
    *                        기본값(false)은 stdio:'inherit' 라 사람만 볼 수 있다.
    * options.allowFailure : capture 와 함께 쓴다. 실패해도 던지지 않고
    *                        { code, stdout, stderr, output } 을 돌려준다.
+   * options.env          : 자식 프로세스에만 얹을 환경변수. 배포 스크립트가
+   *                        인자 대신 환경변수로 값을 받기 때문에 필요하다
+   *                        (#P202609_002 [D10] — 위치 인자는 순서를 틀리면
+   *                        조용히 잘못 동작한다).
+   *                        ⚠️ process.env 를 **덮어쓰지 않는다.** 여기서 합쳐서
+   *                        넘기지 않으면 PATH·GIT_ASKPASS 가 통째로 사라진다.
    */
   runCommand(cmd, cwd, options = {}) {
     const execOptions = { shell: true };
+    if (options.env) {
+      execOptions.env = { ...process.env, ...options.env };
+    }
     if (options.capture) {
       execOptions.stdio = ['ignore', 'pipe', 'pipe'];
       execOptions.encoding = 'utf8';

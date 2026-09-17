@@ -24,4 +24,12 @@
       , "USER" : "admin"
       , "API_TOKEN" : "${env.JENKINS_DEV_API_TOKEN}"
     }
+
+    , "telegram" : {
+        "_comment" : "배포 공지. job_name 이 있으면 그 잡으로 보내고(토큰 불필요), 비우면 도구가 직접 보낸다. docs/design/배포/04_젠킨스_잡.md"
+      , "job_name" : "<공지 잡 이름>"
+      , "job_server" : "jenkins"
+      , "token" : "${env.TELEGRAM_TOKEN}"
+      , "chat_id" : "<채팅방 ID>"
+    }
 }

@@ -23,7 +23,11 @@ const CARRY_KEYS = [
   // 이 배포가 만든 백업 폴더. **롤백이 읽는 값이다.**
   // 폴더를 훑어 최신을 집는 방식은 그것이 성공한 배포였는지 알 수 없다.
   // 되돌릴 대상을 고르려면 라이브 경로·원격 여부도 함께 있어야 한다.
-  'backup_path', 'web_deploy_path', 'deploy_remote', 'iis_site', 'host', 'port'
+  'backup_path', 'web_deploy_path', 'deploy_remote', 'host', 'port',
+  // 웹서버 제어에 필요한 값들. `iis_site` 는 구명이고 지금 이름은 `web_server_name` 이다 —
+  // **둘 다 이월한다.** 기존 yaml 이 수정 없이 돌아야 하고(#P002-REQ5), 새 yaml 도
+  // 그룹을 나눠 부를 때 이름을 잃으면 안 된다.
+  'iis_site', 'web_server_name', 'web_server_type', 'web_server_pool', 'script_dir'
 ];
 
 const MAX_CHANGED_FILES = 500;
@@ -153,6 +157,20 @@ class DeployState {
       if (error) run.error = String(error).slice(0, 500);
       run.finished_at = new Date().toISOString();
     });
+  }
+
+  /**
+   * 공지를 보냈다고 표시한다.
+   *
+   * 젠킨스는 그룹마다 프로세스를 새로 띄우므로(`--only`) 같은 실행을 여러 번
+   * 종료 처리하게 된다. 이 표식이 없으면 배포 한 번에 공지가 여러 번 나간다.
+   *
+   * ⚠️ **보관 규칙에는 다시 엮지 않는다.** 예전에 `announced === false` 인 실행을
+   *    무조건 남기는 조건이 있었는데, 이 값을 true 로 만드는 코드가 없어서
+   *    아무것도 정리되지 않았다(2026-09-01 확인). 그 조건은 걷어낸 상태다.
+   */
+  markAnnounced(key) {
+    this.#update(key, run => { run.announced = true; });
   }
 
   /**

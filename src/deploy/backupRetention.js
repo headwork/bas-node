@@ -14,15 +14,29 @@ function escapeRegExp(str) {
 }
 
 /**
- * 백업 폴더 이름 규칙: `<라이브폴더명>_backup_<YYYYMMDD_HHMMSS>`
+ * 백업 폴더 이름 규칙: `<라이브폴더명>_<YYYYMMDD_HHMMSS>[_N]`
  *
  * 사람이 읽을 수 있어야 한다 — 긴급 배포 때 **사람이 고르는 폴더**다.
- * 옛 형식(epoch 밀리초)도 계속 인식한다. 안 그러면 이미 쌓인 백업이 고아가 되어
- * 정리도 롤백도 닿지 않는다.
+ * `_backup_` 은 넣지 않는다. 상위가 이미 백업 폴더(`backup_root`)라 중복이다.
+ *
+ * ⚠️ **시각은 14자리 형식만 받는다.** 표식(`_backup_`)이 빠졌으므로 숫자만 보고
+ *    고르게 되는데, 옛 epoch 형식(`\d{10,}`)까지 받으면 다른 도구의 운영 일일 백업
+ *    `MFM.Shore_2026091712`(10자리)가 **삭제 대상에 걸린다.** 옛 형식(`_backup_`·epoch)은
+ *    인식하지 않는다 — 자동 정리 대상에서 빠질 뿐 지워지지 않는다(사람이 정리한다).
+ *
+ * `_N` 은 `uniquePath` 가 같은 초의 충돌을 비켜 간 이름이다. 빠뜨리면 그 백업이
+ * 정리에도 롤백 목록에도 안 잡힌다.
+ *
+ * 대소문자는 구분한다. 넓히면 `MFM.SHORE` 와 `MFM.Shore` 가 서로를 지울 수 있다.
  */
 function backupPatternFor(deployPath) {
   const base = path.basename(deployPath);
-  return new RegExp('^' + escapeRegExp(base) + '_backup_(\\d{8}_\\d{6}|\\d{10,})$');
+  return new RegExp('^' + escapeRegExp(base) + '_(\\d{8}_\\d{6})(?:_(\\d+))?$');
+}
+
+/** 백업 폴더 이름. 배포·롤백 네 곳이 같은 식을 들고 있지 않도록 여기서만 만든다. */
+function backupName(deployPath, stamp = stampNow()) {
+  return `${path.basename(deployPath)}_${stamp}`;
 }
 
 /** 백업 폴더 이름에 쓰는 시각 문자열. 사전순 정렬이 곧 시간순이다. */
@@ -32,15 +46,47 @@ function stampNow(date = new Date()) {
     `${p(date.getHours())}${p(date.getMinutes())}${p(date.getSeconds())}`;
 }
 
-/** 두 형식(YYYYMMDD_HHMMSS · epoch 밀리초) 모두 정렬 가능한 수로 바꾼다. */
+/**
+ * 아직 안 쓰인 경로를 고른다. 이미 있으면 `_2`, `_3` … 을 붙인다.
+ *
+ * ⚠️ 타임스탬프는 **초 단위**다. 배포와 강제 롤백이 같은 초에 일어나면 이름이 겹친다 —
+ *    드물지만 자동화에서는 실제로 난다. 그때 스크립트는 `1` 로 거부하고(옳다.
+ *    move 는 기존 폴더 **안으로** 들어가 성공한 것처럼 보인다), 롤백이 통째로 막힌다.
+ *
+ * 예전 `FsRenameStage` 는 반대로 **기존 대상을 지우고** 덮어썼다. 그쪽이 더 나쁘다 —
+ * 겹친 상대가 멀쩡한 백업이면 그것을 지운다. 이름을 비켜 가는 것이 옳다.
+ */
+function uniquePath(candidate, exists = fs.existsSync) {
+  if (!exists(candidate)) return candidate;
+  for (let n = 2; n < 1000; n++) {
+    const next = `${candidate}_${n}`;
+    if (!exists(next)) return next;
+  }
+  throw new Error(`이름이 겹치지 않는 경로를 찾지 못했습니다: ${candidate}`);
+}
+
+/** `YYYYMMDD_HHMMSS` 를 정렬 가능한 수로 바꾼다. 형식이 아니면 null. */
 function parseStamp(raw) {
   const m = /^(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})$/.exec(raw);
-  if (m) {
-    const [, y, mo, d, h, mi, s] = m;
-    return new Date(+y, +mo - 1, +d, +h, +mi, +s).getTime();
+  if (!m) return null;
+  const [, y, mo, d, h, mi, s] = m;
+  return new Date(+y, +mo - 1, +d, +h, +mi, +s).getTime();
+}
+
+/** 이름 목록에서 규칙에 맞는 것만 골라 최신순으로. 같은 초면 `_N` 이 큰 쪽이 나중이다. */
+function matchBackups(names, deployPath, toPath) {
+  const pattern = backupPatternFor(deployPath);
+  const result = [];
+
+  for (const name of names) {
+    const matched = pattern.exec(name);
+    if (!matched) continue;
+    const timestamp = parseStamp(matched[1]);
+    if (timestamp === null) continue;
+    result.push({ name, path: toPath(name), timestamp, seq: Number(matched[2] || 1) });
   }
-  const epoch = Number(raw);
-  return Number.isFinite(epoch) && epoch > 0 ? epoch : null;
+
+  return result.sort((a, b) => (b.timestamp - a.timestamp) || (b.seq - a.seq));
 }
 
 /**
@@ -53,41 +99,15 @@ function listBackups(deployPath, backupRoot) {
   const parentDir = backupRoot || path.dirname(deployPath);
   if (!fs.existsSync(parentDir)) return [];
 
-  const pattern = backupPatternFor(deployPath);
-  const result = [];
-
-  for (const entry of fs.readdirSync(parentDir, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const matched = pattern.exec(entry.name);
-    if (!matched) continue;
-
-    const timestamp = parseStamp(matched[1]);
-    if (timestamp === null) continue;
-
-    result.push({
-      name: entry.name,
-      path: path.join(parentDir, entry.name),
-      timestamp
-    });
-  }
-
-  return result.sort((a, b) => b.timestamp - a.timestamp);
+  const dirs = fs.readdirSync(parentDir, { withFileTypes: true })
+    .filter(e => e.isDirectory())
+    .map(e => e.name);
+  return matchBackups(dirs, deployPath, name => path.join(parentDir, name));
 }
 
 /** 원격에서 받은 이름 목록에 같은 규칙을 적용한다. 파일시스템을 읽지 않는다. */
 function selectFromNames(names, deployPath, backupRoot, config) {
-  const pattern = backupPatternFor(deployPath);
-  const backups = [];
-
-  for (const name of names) {
-    const matched = pattern.exec(name);
-    if (!matched) continue;
-    const timestamp = parseStamp(matched[1]);
-    if (timestamp === null) continue;
-    backups.push({ name, path: `${backupRoot}\\${name}`, timestamp });
-  }
-
-  backups.sort((a, b) => b.timestamp - a.timestamp);
+  const backups = matchBackups(names, deployPath, name => `${backupRoot}\\${name}`);
   return selectBackups(backups, new Date(), config);
 }
 
@@ -167,7 +187,9 @@ function applyRetention(deployPath, config, logger = console, backupRoot) {
 module.exports = {
   DEFAULTS,
   backupPatternFor,
+  backupName,
   stampNow,
+  uniquePath,
   parseStamp,
   listBackups,
   selectFromNames,
