@@ -1,5 +1,5 @@
 const BaseStage = require('./BaseStage');
-const { applyRetention, backupName, uniquePath } = require('../backupRetention');
+const { applyRetention, removeLeftovers, backupName, uniquePath } = require('../backupRetention');
 const { decideConfigSource, formatDecision } = require('../configPreserve');
 const { DEPLOY, reasonFor } = require('../scriptExit');
 const { joinPreserve } = require('../scriptArgs');
@@ -230,6 +230,11 @@ class LocalDeployMacroStage extends BaseStage {
         ...(stageConfig && stageConfig.backup ? stageConfig.backup : {})
       };
       applyRetention(deployPath, retentionConfig, console, backupRoot);
+
+      // 롤백이 라이브 옆에 남긴 `_failed_`·`_replaced_` 도 여기서 지운다.
+      // 배포가 성공했으면 그 실패는 지나갔다 — 앞으로 갈 사본은 배포 zip 이다.
+      console.log(`[LocalDeployMacroStage] 롤백 잔여 폴더 정리`);
+      removeLeftovers(deployPath, retentionConfig, console);
     } catch (err) {
       console.error(`[LocalDeployMacroStage] Backup retention failed (deployment is unaffected): ${err.message}`);
     }

@@ -34,6 +34,67 @@ function backupPatternFor(deployPath) {
   return new RegExp('^' + escapeRegExp(base) + '_(\\d{8}_\\d{6})(?:_(\\d+))?$');
 }
 
+/**
+ * 롤백이 **라이브 옆에** 남긴 폴더의 이름 규칙.
+ *
+ *   `<라이브>_failed_<시각>`    배포중 롤백(consume)이 치운 실패본
+ *   `<라이브>_replaced_<시각>`  강제 롤백(copy)이 지우지 못한 옛 라이브 (정상이면 스크립트가 바로 지운다)
+ *
+ * 둘 다 **다음 배포가 성공하면** 지운다. 실패본은 원인을 볼 때까지만 의미가 있고,
+ * 성공한 배포가 나왔다는 것은 그 실패가 지나갔다는 뜻이다. 앞으로 갈 사본은
+ * 배포 zip 이지 이 폴더가 아니다.
+ *
+ * 백업 규칙과 같은 이유로 대소문자를 구분하고, 라이브 이름 뒤에 표식이 바로 와야 한다 —
+ * `MFM.SHORE` 의 정리가 `MFM.SHORE_QA_failed_…` 를 지우면 안 된다.
+ */
+function leftoverPatternFor(deployPath) {
+  const base = path.basename(deployPath);
+  return new RegExp('^' + escapeRegExp(base) + '_(?:failed|replaced)_\\d{8}_\\d{6}(?:_\\d+)?$');
+}
+
+/** 이름 목록에서 롤백 잔여 폴더만 고른다. 원격도 이 함수를 쓴다(목록만 ssh 로 받는다). */
+function selectLeftovers(names, deployPath) {
+  const pattern = leftoverPatternFor(deployPath);
+  return names.filter(name => pattern.test(name)).sort();
+}
+
+/**
+ * 라이브 옆의 롤백 잔여 폴더를 지운다. **배포가 성공한 뒤에만** 부른다.
+ *
+ * 백업 보관 정책(`backup`)의 `enabled:false`·`dry_run` 을 그대로 따른다 —
+ * "자동으로 지우지 마라" 는 설정이 폴더 종류마다 따로 있으면 한쪽을 빠뜨린다.
+ * 지우지 못한 것은 배포 성공을 뒤집지 않는다.
+ */
+function removeLeftovers(deployPath, config, logger = console) {
+  const opts = { ...DEFAULTS, ...(config || {}) };
+  const parentDir = path.dirname(deployPath);
+  if (opts.enabled === false || !fs.existsSync(parentDir)) return { removed: [], failed: [] };
+
+  const dirs = fs.readdirSync(parentDir, { withFileTypes: true })
+    .filter(e => e.isDirectory())
+    .map(e => e.name);
+  const targets = selectLeftovers(dirs, deployPath);
+  const removed = [];
+  const failed = [];
+
+  for (const name of targets) {
+    if (opts.dry_run) {
+      logger.log(`  [dry-run] would remove ${name}`);
+      continue;
+    }
+    try {
+      fs.rmSync(path.join(parentDir, name), { recursive: true, force: true });
+      logger.log(`  [remove] ${name}`);
+      removed.push(name);
+    } catch (err) {
+      logger.error(`  [FAILED] ${name}: ${err.message}`);
+      failed.push({ name, error: err.message });
+    }
+  }
+
+  return { removed, failed };
+}
+
 /** 백업 폴더 이름. 배포·롤백 네 곳이 같은 식을 들고 있지 않도록 여기서만 만든다. */
 function backupName(deployPath, stamp = stampNow()) {
   return `${path.basename(deployPath)}_${stamp}`;
@@ -187,6 +248,9 @@ function applyRetention(deployPath, config, logger = console, backupRoot) {
 module.exports = {
   DEFAULTS,
   backupPatternFor,
+  leftoverPatternFor,
+  selectLeftovers,
+  removeLeftovers,
   backupName,
   stampNow,
   uniquePath,

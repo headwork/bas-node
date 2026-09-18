@@ -4,6 +4,34 @@ const fs = require('fs');
 const path = require('path');
 
 /**
+ * 배포용 소스를 원격 브랜치에 **그대로** 맞추는 명령.
+ *
+ * 배포서버의 소스는 원격의 사본이다. 여기서 고치는 사람은 없고, 합칠 대상도 아니다.
+ * 그래서 pull(= fetch + merge)을 하지 않고 원격 커밋으로 브랜치를 옮긴다.
+ *
+ * 🔴 예전 명령은 `git stash && ... && git checkout <br> && git pull origin <br>` 였다.
+ *    2026-09-18 dev 젠킨스(plWesysDeployNode #7)에서 로컬 브랜치가 원격과 60:100 으로
+ *    갈라져 있었고, pull 이 **merge 커밋**을 만들려다 `Committer identity unknown` 으로 죽었다.
+ *    신원을 넣어 주면 오류는 사라지지만, 옛 커밋 60개와 원격을 합친 — 원격 어디에도 없는 —
+ *    코드가 빌드돼 **에러 없이** 배포된다. 막아 준 것은 오류 쪽이었다.
+ *
+ *   fetch +refs/heads/<br>:refs/remotes/origin/<br>
+ *       대상 브랜치만 받는다(전부 받으면 로그에 master 갱신이 섞여 "master 와 비교하나?" 로 읽힌다).
+ *       `+` 는 원격이 force push 로 다시 만들어졌어도 추적 브랜치를 갱신한다.
+ *   checkout -f -B <br> origin/<br>
+ *       로컬 브랜치를 원격 커밋으로 다시 세운다. 갈라졌어도, HEAD 가 detached 여도 결과가 같다.
+ *       `-f` 는 추적 파일의 로컬 수정을 버린다(예전 stash 도 넣기만 하고 꺼내지 않았다).
+ *
+ * 둘 다 커밋을 만들지 않으므로 **git 신원이 필요 없다.**
+ * 추적되지 않는 파일(빌드 스크립트가 복사해 두는 pubxml, bin·obj)은 건드리지 않는다 —
+ * `git clean` 을 하면 obj 까지 지워져 매번 전체 복원·빌드가 된다.
+ */
+function syncCommand(branch) {
+  return `git fetch origin +refs/heads/${branch}:refs/remotes/origin/${branch}` +
+    ` && git checkout -f -B ${branch} origin/${branch}`;
+}
+
+/**
  * Git 동기화 + 변경 내용 분류.
  *
  * 동기화 전후의 커밋을 비교해 무엇이 바뀌었는지 컨텍스트에 실어 둔다.
@@ -61,12 +89,8 @@ class GitSyncStage extends BaseStage {
     const before = isExisting ? this.revParse(buildPath) : null;
 
     if (isExisting) {
-      console.log(`[GitSyncStage] Found existing .git repository. Executing git pull...`);
-      // fetch 를 대상 브랜치로 좁힌다. `git fetch origin` 은 master 를 포함해 전부 받아와서
-      // 로그에 master 갱신 줄이 섞여 "master 와 비교하나?" 로 읽힌다. 비교는 언제나
-      // 이 브랜치의 pull 전/후 커밋 사이에서만 한다.
-      const cmd = `git stash && git fetch origin ${branch} && git checkout ${branch} && git pull origin ${branch}`;
-      this.engine.runCommand(cmd, buildPath);
+      console.log(`[GitSyncStage] Found existing .git repository. 원격 ${branch} 에 맞춥니다...`);
+      this.engine.runCommand(syncCommand(branch), buildPath);
     } else {
       // URL 에 박힌 자격증명은 가리고 출력한다 (#P001-REQ8)
       console.log(`[GitSyncStage] Repository not found locally. Cloning from ${maskUrlCredentials(gitUrl)}...`);
@@ -265,3 +289,4 @@ class GitSyncStage extends BaseStage {
 }
 
 module.exports = GitSyncStage;
+module.exports.syncCommand = syncCommand;

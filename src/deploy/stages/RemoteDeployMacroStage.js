@@ -1,6 +1,6 @@
 const BaseStage = require('./BaseStage');
 const path = require('path');
-const { stampNow, backupName, selectFromNames } = require('../backupRetention');
+const { stampNow, backupName, selectFromNames, selectLeftovers } = require('../backupRetention');
 const { decideConfigSource, formatDecision, ticksToEpochMs } = require('../configPreserve');
 const { makeSshRunner } = require('../sshRunner');
 const { syncRemoteScripts, defaultScriptDir } = require('../scriptSync');
@@ -302,6 +302,14 @@ class RemoteDeployMacroStage extends BaseStage {
       console.error(`[RemoteDeploy] 원격 정리 실패(배포는 정상): ${err.message}`);
     }
 
+    // 8. 롤백이 라이브 옆에 남긴 `_failed_`·`_replaced_` 정리.
+    //    배포가 성공했으면 그 실패는 지나갔다 — 앞으로 갈 사본은 배포 zip 이다.
+    try {
+      this.#cleanupLeftovers(ssh, livePath);
+    } catch (err) {
+      console.error(`[RemoteDeploy] 롤백 잔여 폴더 정리 실패(배포는 정상): ${err.message}`);
+    }
+
     console.log(`[RemoteDeploy] Completed. 백업: ${backupPath}`);
   }
 
@@ -332,6 +340,36 @@ class RemoteDeployMacroStage extends BaseStage {
     for (const item of remove) {
       ssh(`rmdir /s /q ${root}\\${item.name}`, { capture: true, allowFailure: true });
       console.log(`  [remove] ${item.name}`);
+    }
+  }
+
+  /**
+   * 라이브 옆의 롤백 잔여 폴더를 지운다. 백업 정리와 같은 방식이다 — 목록만 받아 오고
+   * 고르는 규칙(`selectLeftovers`)은 로컬과 같은 함수를 쓴다.
+   */
+  #cleanupLeftovers(ssh, livePath) {
+    const policy = this.engine.context.backup || {};
+    if (policy.enabled === false) return;
+
+    const parent = livePath.replace(/\\[^\\]+$/, '');
+    const listed = ssh(`dir /b /ad ${parent}`, { capture: true, allowFailure: true });
+    if (listed.code !== 0) {
+      console.log(`[RemoteDeploy] 라이브 상위 폴더 목록을 읽지 못했습니다: ${parent}`);
+      return;
+    }
+
+    const names = (listed.output || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    const targets = selectLeftovers(names, livePath);
+    if (targets.length === 0) return;
+
+    console.log(`[RemoteDeploy] 롤백 잔여 폴더 ${targets.length}건 삭제`);
+    for (const name of targets) {
+      if (policy.dry_run) {
+        console.log(`  [dry-run] would remove ${name}`);
+        continue;
+      }
+      ssh(`rmdir /s /q ${parent}\\${name}`, { capture: true, allowFailure: true });
+      console.log(`  [remove] ${name}`);
     }
   }
 

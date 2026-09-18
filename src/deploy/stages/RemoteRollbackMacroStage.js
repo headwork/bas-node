@@ -4,7 +4,7 @@ const { makeSshRunner } = require('../sshRunner');
 const { syncRemoteScripts, defaultScriptDir } = require('../scriptSync');
 const { ROLLBACK, reasonFor } = require('../scriptExit');
 const { assertRemotePath } = require('../remoteEnv');
-const { backupName } = require('../backupRetention');
+const { joinPreserve } = require('../scriptArgs');
 
 /**
  * 원격 서버의 라이브를 백업 폴더로 되돌린다. local_rollback 의 SSH 판이다.
@@ -58,13 +58,18 @@ class RemoteRollbackMacroStage extends BaseStage {
     const target = this.#pickBackup(config);
     if (!target) return;
 
+    // 운영 중 생긴 데이터는 배포와 **같은 목록·같은 규칙**으로 넘긴다 (local_rollback 과 같다).
+    // 이름 검증은 스크립트 전송보다 먼저다 — 원격에 아무것도 하기 전에 멈춘다.
+    const preserve = config.preserve || this.engine.context.preserve || [];
+    const preserveArg = joinPreserve(preserve);
+
     const keepBackup = target.mode === 'copy';
     const targetPath = win(target.path);
     const stamp = this.#stamp();
     const tempPath = `${livePath}_rollback_${stamp}`;
-    const asidePath = keepBackup
-      ? `${win(target.root || path.dirname(targetPath))}\\${backupName(livePath, stamp)}`
-      : `${livePath}_failed_${stamp}`;
+    // 치워 둘 자리는 local_rollback 과 같다 — 실패본은 `_failed_`(다음 배포 성공 시 삭제),
+    // 강제 롤백이 밀어낸 라이브는 `_replaced_`(서비스가 다시 뜨면 스크립트가 삭제).
+    const asidePath = `${livePath}_${keepBackup ? 'replaced' : 'failed'}_${stamp}`;
 
     const ssh = this.#sshRunner({ target: user ? `${user}@${host}` : host, port, keyPath, basePath });
 
@@ -100,6 +105,7 @@ class RemoteRollbackMacroStage extends BaseStage {
     console.log(`  live   ${livePath}`);
     console.log(`  source ${targetPath}`);
     console.log(`  aside  ${asidePath}`);
+    if (preserve.length > 0) console.log(`  preserve ${preserve.join(', ')}`);
 
     const r = ssh(`${scriptDir}\\rollback.bat`, {
       capture: true,
@@ -112,6 +118,7 @@ class RemoteRollbackMacroStage extends BaseStage {
         // 같은 지점으로 몇 번이든 다시 되돌릴 수 있다.
         RB_MODE: keepBackup ? 'copy' : 'consume',
         RB_TEMP: keepBackup ? tempPath : undefined,
+        RB_PRESERVE: preserveArg || undefined,
         WS_SKIP: manageIis ? undefined : '1',
         WS_TYPE: manageIis ? wsType : undefined,
         WS_NAME: manageIis ? siteName : undefined,
@@ -170,7 +177,6 @@ class RemoteRollbackMacroStage extends BaseStage {
 
       return {
         path: run.variables.backup_path,
-        root: path.dirname(String(run.variables.backup_path).replace(/\//g, '\\')),
         mode: 'copy',
         runKey: run.key
       };
@@ -181,7 +187,7 @@ class RemoteRollbackMacroStage extends BaseStage {
     // 그것을 백업으로 착각하면 보관 폴더 전체가 라이브 자리로 옮겨간다.
     const armed = this.engine.context.rollbackArmed || vars.rollback_armed === true;
     const own = armed ? vars.backup_path : null;
-    if (own) return { path: own, root: path.dirname(String(own).replace(/\//g, '\\')), mode: 'consume', runKey: null };
+    if (own) return { path: own, mode: 'consume', runKey: null };
 
     console.log(`[RemoteRollback] 되돌릴 백업이 없습니다 - 라이브를 건드리기 전에 실패했습니다.`);
     return null;

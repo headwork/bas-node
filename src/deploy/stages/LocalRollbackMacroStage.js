@@ -1,7 +1,8 @@
 const BaseStage = require('./BaseStage');
-const { listBackups, backupName, stampNow, uniquePath } = require('../backupRetention');
+const { listBackups, stampNow, uniquePath } = require('../backupRetention');
 const { ROLLBACK, reasonFor } = require('../scriptExit');
 const { assertScript, defaultScriptDir } = require('../scriptSync');
+const { joinPreserve } = require('../scriptArgs');
 const path = require('path');
 const fs = require('fs');
 
@@ -45,21 +46,29 @@ class LocalRollbackMacroStage extends BaseStage {
     const target = this.#pickBackup(config, deployPath);
     if (!target) return;   // 되돌릴 변경이 없다 (사유는 #pickBackup 이 출력한다)
 
+    // 운영 중 생긴 데이터(업로드·캐시)는 배포와 **같은 목록·같은 규칙**으로 넘긴다.
+    // 롤백은 코드를 옛것으로 되돌리는 것이지 데이터를 되돌리는 것이 아니다 —
+    // 빠뜨리면 롤백은 성공하고 그 사이의 업로드만 사라진다. 에러는 나지 않는다.
+    // 이름 검증(공백·와일드카드)은 **라이브를 건드리기 전에** 한다.
+    const preserve = config.preserve || this.engine.context.preserve || [];
+    const preserveArg = joinPreserve(preserve);
+
     const keepBackup = target.mode === 'copy';
     console.log(`[LocalRollback] Restoring ${siteName} from ${path.basename(target.path)}` +
       ` (${keepBackup ? '백업 보존' : '백업 소비'})`);
 
-    // 현재 라이브를 치워 둘 자리.
+    // 현재 라이브를 치워 둘 자리. 둘 다 **라이브 옆**이다 — 같은 볼륨이라 move 가 이름 바꾸기로 끝난다.
     //   파이프라인 실패로 도는 경우는 그 배포본이 원인이므로 `_failed_` 로 격리한다.
-    //   사람이 부른 강제 롤백은 실패한 것이 아니므로 백업 이름으로 남긴다 —
-    //   그래야 "되돌렸다가 다시 최신으로" 가 가능하다. **이것이 Node 의 판단이다.**
+    //     다음 배포가 성공하면 지운다 (removeLeftovers).
+    //   사람이 부른 강제 롤백은 `_replaced_` 로 치우고 **서비스가 다시 뜨면 스크립트가 지운다.**
+    //     강제 롤백을 했다는 것은 그 라이브가 문제였다는 뜻이다. 앞으로 갈 사본은 배포 zip 이고,
+    //     운영 데이터는 이미 preserve 로 넘어왔다. 백업 이름으로 남기면 보관 개수만 잡아먹는다.
     //
     //   ⚠️ 타임스탬프가 초 단위라 **같은 초에 배포하고 되돌리면 이름이 겹친다.**
     //      스크립트는 겹치면 거부하므로(옳다) Node 가 비켜 간 이름을 준다.
     const stamp = stampNow();
-    const asidePath = uniquePath(keepBackup
-      ? path.join(target.root || path.dirname(deployPath), backupName(deployPath, stamp))
-      : path.join(path.dirname(deployPath), `${path.basename(deployPath)}_failed_${stamp}`));
+    const asidePath = uniquePath(path.join(path.dirname(deployPath),
+      `${path.basename(deployPath)}_${keepBackup ? 'replaced' : 'failed'}_${stamp}`));
 
     // 복사 → 정지 → 치우기 → 복귀 → 시작. **스크립트 한 번이다** (#P002-TASK7).
     // 원격과 같은 스크립트, 같은 종료코드 표를 쓴다 — 다른 것은 호출 경로뿐이다.
@@ -79,6 +88,7 @@ class LocalRollbackMacroStage extends BaseStage {
     console.log(`  live   ${deployPath}`);
     console.log(`  source ${target.path}`);
     console.log(`  aside  ${asidePath}`);
+    if (preserve.length > 0) console.log(`  preserve ${preserve.join(', ')}`);
 
     const r = this.engine.runCommand(`"${script}"`, basePath, {
       capture: true,
@@ -91,6 +101,7 @@ class LocalRollbackMacroStage extends BaseStage {
         // 강제 롤백은 **서비스가 살아 있는 동안** 복제부터 끝낸다.
         // 정지 구간에 690MB 복사를 넣으면 그만큼 서비스가 죽어 있게 된다.
         RB_TEMP: keepBackup ? scratch : '',
+        RB_PRESERVE: preserveArg,
         WS_SKIP: manageIis ? '' : '1',
         WS_TYPE: manageIis ? wsType : '',
         WS_NAME: manageIis ? siteName : '',
@@ -126,7 +137,7 @@ class LocalRollbackMacroStage extends BaseStage {
   /**
    * 되돌릴 백업을 고른다.
    *
-   * @returns {{path, root, mode, runKey}|null}  null 이면 되돌릴 것이 없다
+   * @returns {{path, mode, runKey}|null}  null 이면 되돌릴 것이 없다
    */
   #pickBackup(config, deployPath) {
     const vars = this.engine.context.variables;
@@ -170,7 +181,7 @@ class LocalRollbackMacroStage extends BaseStage {
       console.log(`[LocalRollback]   배포키 ${run.key} / 커밋 ${(run.variables.git_to || '').slice(0, 8) || '-'}` +
         ` / ${run.finished_at || run.started_at}`);
 
-      return { path: backupPath, root: path.dirname(backupPath), mode: 'copy', runKey: run.key };
+      return { path: backupPath, mode: 'copy', runKey: run.key };
     }
 
     // ── 배포중 롤백: 이번 실행이 **만든** 백업을 그대로 쓴다
@@ -182,7 +193,7 @@ class LocalRollbackMacroStage extends BaseStage {
     const armed = this.engine.context.rollbackArmed || vars.rollback_armed === true;
     const own = armed ? vars.backup_path : null;
     if (own && fs.existsSync(own)) {
-      return { path: own, root: path.dirname(own), mode: 'consume', runKey: null };
+      return { path: own, mode: 'consume', runKey: null };
     }
 
     // ── 전환기 폴백: 이력에 경로가 없던 시절의 백업은 폴더를 훑어 찾는다
@@ -190,7 +201,7 @@ class LocalRollbackMacroStage extends BaseStage {
     const found = listBackups(deployPath, backupRoot);
     if (found.length > 0) {
       console.log(`[LocalRollback] 이력에 백업 경로가 없어 폴더에서 찾았습니다: ${found[0].name}`);
-      return { path: found[0].path, root: path.dirname(found[0].path), mode: 'consume', runKey: null };
+      return { path: found[0].path, mode: 'consume', runKey: null };
     }
 
     // 백업이 없다는 것에는 두 가지 경우가 있다. 뭉뚱그리면 오해를 부른다.
