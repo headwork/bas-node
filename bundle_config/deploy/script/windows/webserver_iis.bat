@@ -7,7 +7,9 @@ rem  WS_TYPE, so supporting nginx means adding webserver_nginx.bat next to this
 rem  one - deploy.bat itself never changes.
 rem
 rem  INPUT (environment variables)
-rem    WS_ACTION   stop | start | reload      (required)
+rem    WS_ACTION   stop | start | reload | status   (required)
+rem                status changes nothing: 0 = site AND pool Started,
+rem                6 = either one is not (patch.bat starts it then)
 rem    WS_NAME     IIS site name              (required)
 rem    WS_POOL     app pool name              (optional, defaults to WS_NAME)
 rem    DRY_RUN     1 = print plan, change nothing
@@ -18,6 +20,7 @@ rem    0   success, INCLUDING "already in the desired state"
 rem    2   bad or missing input
 rem    3   insufficient privileges
 rem    4   target not found (IIS absent, or unknown site/pool)
+rem    6   status only: not running. An answer, not a failure
 rem    1   unknown failure
 rem
 rem  WHY THIS FILE IS ASCII ONLY
@@ -37,7 +40,7 @@ rem ===========================================================================
 setlocal EnableExtensions
 
 if not defined WS_ACTION (
-    echo [webserver] WS_ACTION is required ^(stop^|start^|reload^)
+    echo [webserver] WS_ACTION is required ^(stop^|start^|reload^|status^)
     exit /b 2
 )
 if not defined WS_NAME (
@@ -57,6 +60,7 @@ if not exist "%APPCMD%" (
 if /i "%WS_ACTION%"=="stop"   goto :act_stop
 if /i "%WS_ACTION%"=="start"  goto :act_start
 if /i "%WS_ACTION%"=="reload" goto :act_reload
+if /i "%WS_ACTION%"=="status" goto :act_status
 
 echo [webserver] unknown WS_ACTION: %WS_ACTION%
 exit /b 2
@@ -115,6 +119,36 @@ rem :propagate keeps the real code, because that line is parsed after the jump.
     )
     echo [webserver] OK recycle apppool %WS_POOL%
     exit /b 0
+
+
+:act_status
+    rem Both must be Started. A started site on a stopped pool answers 503 -
+    rem that is "down" for our purpose, and rapid-fail protection stops pools
+    rem exactly that way. Unknown (e.g. Stopping) is not running either.
+    call :target_of site
+    if not defined WS_READABLE goto :status_denied
+    if not defined WS_TARGET   goto :status_absent
+    call :state_of site
+    set "WS_SITE_STATE=%WS_STATE%"
+
+    call :target_of apppool
+    if not defined WS_READABLE goto :status_denied
+    if not defined WS_TARGET   goto :status_absent
+    call :state_of apppool
+
+    echo [webserver] site %WS_NAME% %WS_SITE_STATE%, apppool %WS_POOL% %WS_STATE%
+    if /i not "%WS_SITE_STATE%"=="Started" exit /b 6
+    if /i not "%WS_STATE%"=="Started" exit /b 6
+    exit /b 0
+
+:status_denied
+    echo [webserver] cannot read IIS configuration for %WS_OBJ%
+    echo [webserver]   run elevated - the name is not the problem
+    exit /b 3
+
+:status_absent
+    echo [webserver] not found: %WS_OBJ%
+    exit /b 4
 
 
 rem ---------------------------------------------------------------------------

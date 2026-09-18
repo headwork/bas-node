@@ -27,24 +27,39 @@ const CARRY_KEYS = [
   // 웹서버 제어에 필요한 값들. `iis_site` 는 구명이고 지금 이름은 `web_server_name` 이다 —
   // **둘 다 이월한다.** 기존 yaml 이 수정 없이 돌아야 하고(#P002-REQ5), 새 yaml 도
   // 그룹을 나눠 부를 때 이름을 잃으면 안 된다.
-  'iis_site', 'web_server_name', 'web_server_type', 'web_server_pool', 'script_dir'
+  'iis_site', 'web_server_name', 'web_server_type', 'web_server_pool', 'script_dir',
+  // 이번 배포가 웹서버를 (다시) 띄웠는가. health_check 의 `if:` 가 읽는다 —
+  // 재시작이 없었으면 확인할 것도 없다(정적 배포).
+  'server_restarted'
 ];
 
 const MAX_CHANGED_FILES = 500;
 const MAX_CHANGED_COMMITS = 300;
 
 class DeployState {
-  constructor({ statePath, lockPath, keep = 10, ttlMinutes = 60 }) {
+  /**
+   * @param statePath   이 환경의 상태 파일. **환경마다 따로다** — 아래 참고
+   * @param legacyPath  환경을 가르기 전의 공용 상태 파일. 이 환경 파일이 아직 없을 때만 읽는다
+   * @param environment 공용 파일에서 이 환경의 기록만 골라 올 때 쓴다
+   *
+   * ⚠️ 상태 파일은 환경별이어야 한다. 락은 환경별이라 qa·prod 가 동시에 돌 수 있는데,
+   *    파일이 하나면 둘이 같은 JSON 을 읽고-고치고-쓴다. 나중에 쓴 쪽이 먼저 쓴 쪽의
+   *    기록(성공 표시·백업 경로)을 **에러 없이** 지운다. 이력은 롤백 후보이자
+   *    다음 배포의 비교 기준이라, 지워지면 둘 다 틀어진다.
+   */
+  constructor({ statePath, lockPath, keep = 10, ttlMinutes = 60, legacyPath = null, environment = null }) {
     this.statePath = statePath;
     this.lockPath = lockPath;
     this.keep = keep;
     this.ttlMs = ttlMinutes * 60 * 1000;
+    this.legacyPath = legacyPath;
+    this.environment = environment;
   }
 
   // ---------------------------------------------------------------- 파일 입출력
 
   load() {
-    if (!fs.existsSync(this.statePath)) return { version: 1, runs: [] };
+    if (!fs.existsSync(this.statePath)) return this.#loadLegacy();
     try {
       const doc = JSON.parse(fs.readFileSync(this.statePath, 'utf8').replace(/^﻿/, ''));
       if (!Array.isArray(doc.runs)) doc.runs = [];
@@ -53,6 +68,24 @@ class DeployState {
       // 깨진 상태파일을 조용히 빈 것으로 취급하면 진행 이력이 사라진 채 새로 시작한다.
       throw new Error(`상태 파일이 올바른 JSON 이 아닙니다: ${this.statePath} - ${err.message}`);
     }
+  }
+
+  /**
+   * 환경별 파일이 생기기 전의 공용 파일에서 이 환경의 기록만 가져온다.
+   * 첫 저장 때 환경 파일로 옮겨지고, 그 뒤로는 공용 파일을 읽지 않는다 (공용 파일은 건드리지 않는다).
+   * 버리면 롤백 후보와 비교 기준이 한꺼번에 사라져 첫 배포가 전체 배포가 된다.
+   */
+  #loadLegacy() {
+    const empty = { version: 1, runs: [] };
+    if (!this.legacyPath || !this.environment || !fs.existsSync(this.legacyPath)) return empty;
+    let doc;
+    try {
+      doc = JSON.parse(fs.readFileSync(this.legacyPath, 'utf8').replace(/^﻿/, ''));
+    } catch {
+      return empty;   // 옛 파일이 깨졌으면 이관하지 않는다. 새 파일은 새로 시작한다
+    }
+    const runs = Array.isArray(doc.runs) ? doc.runs.filter(r => r.environment === this.environment) : [];
+    return { version: 1, runs };
   }
 
   save(doc) {
@@ -191,6 +224,57 @@ class DeployState {
     );
   }
 
+  /**
+   * 이 환경 라이브에 올라가 있는 커밋 — **마지막 성공 배포의 `git_to`**.
+   *
+   * 다음 배포의 비교 기준이다. 작업 폴더의 HEAD 를 쓰면 안 된다 — 실패한 배포도
+   * 폴더는 옮겨 놓고, 다른 실행이 같은 폴더를 쓰기도 한다. 그러면 올라가지 않은 변경이
+   * 차이에서 빠지고, 바뀐 파일만 복사하는 정적 배포에서는 **영영 안 올라간다.**
+   * 이력을 기준으로 하면 실패한 배포의 변경은 다음 배포에 누적되어 함께 나간다.
+   *
+   * 강제 롤백이 더 최근이면 null 이다. 라이브가 옛 백업으로 돌아가 있어서
+   * 이력의 커밋이 라이브를 설명하지 못한다 — 다음 배포는 전체 배포여야 한다.
+   *
+   * @returns {{ commit: string|null, key?: string, why?: string }}
+   */
+  lastDeployedCommit(environment) {
+    for (const r of this.load().runs) {   // 최신순 (begin 이 앞에 넣는다)
+      if (r.environment !== environment) continue;
+      if (r.status === 'rolled_back') {
+        return { commit: null, why: `강제 롤백(${r.key}) 이후 첫 배포` };
+      }
+      if (r.status === 'success' && r.variables && r.variables.git_to) {
+        return { commit: r.variables.git_to, key: r.key };
+      }
+    }
+    return { commit: null, why: '이 환경의 성공 배포 이력이 없음' };
+  }
+
+  /**
+   * 강제 롤백(`--rollback=N`)이 성공했음을 남긴다. 다음 배포를 전체 배포로 돌리는 표식이다.
+   *
+   * 상태를 `success` 로 두지 않는다 — 롤백 후보 목록이 성공 배포를 고르므로,
+   * 그렇게 적으면 롤백 기록이 후보로 섞인다.
+   */
+  recordRollback({ key, environment, lastDeploy }) {
+    const doc = this.load();
+    const now = new Date().toISOString();
+    doc.runs.unshift({
+      key,
+      kind: 'rollback',
+      environment,
+      status: 'rolled_back',
+      last_deploy: lastDeploy || null,
+      started_at: now,
+      updated_at: now,
+      finished_at: now,
+      groups: {},
+      variables: {}
+    });
+    this.#prune(doc);
+    this.save(doc);
+  }
+
   /** 백업이 롤백에 쓰여 사라졌음을 표시한다. */
   markBackupConsumed(key) {
     this.#update(key, run => { run.backup_consumed = true; });
@@ -236,7 +320,10 @@ class DeployState {
     for (const r of doc.runs) {
       if (r.status === 'running') { kept.push(r); continue; }
 
-      const bucket = r.status === 'success' ? 'success' : 'other';
+      // 강제 롤백 기록은 따로 센다. 실패 기록과 섞이면 실패가 쌓일 때 밀려나고,
+      // 그러면 롤백 이전의 성공 배포가 다시 비교 기준이 된다 — 라이브와 안 맞는 기준이다.
+      const bucket = r.status === 'success' ? 'success'
+        : r.status === 'rolled_back' ? 'rollback' : 'other';
       const slot = `${r.environment}:${bucket}`;
       const used = counters.get(slot) || 0;
       if (used < this.keep) {

@@ -50,7 +50,8 @@ node src/deploy/deploy-cli.js --yaml=<경로> [--params='{"environment":"qa"}'] 
 
 | 스테이지 | 역할 |
 |---|---|
-| `git_sync` | 최초 clone, 이후 stash → fetch → checkout → pull |
+| `git_sync` | 최초 clone, 이후 원격 브랜치에 강제로 맞춤(fetch → `checkout -f -B`). 변경 분류의 기준은 **이 환경의 마지막 성공 배포 커밋** |
+| `static_patch` | 정적 파일만 바뀐 배포. 바뀐 파일만 라이브에 덮어쓰기(`patch.bat`), 웹서버는 죽어 있을 때만 시작 |
 | `c#_build` | 빌드 (`cmd` 로 명령 지정) |
 | `archive` | 배포 산출물 압축 (`<name>_<yyyyMMdd_HHmmss>.zip`) |
 | `extract` | 압축 해제 (`tar -xf` — gz/zip 자동 판별) |
@@ -59,23 +60,26 @@ node src/deploy/deploy-cli.js --yaml=<경로> [--params='{"environment":"qa"}'] 
 | `backup_cleanup` | 백업 보관 정책 단독 실행 |
 | `iis_control` | IIS 사이트/앱풀 start·stop |
 | `fs_rename` | 디렉터리 이름 변경 (EXDEV 폴백 포함) |
-| `health_check` | HTTP 상태/본문 확인 |
+| `health_check` | HTTP 상태/본문 확인. `health_url` 이 없으면 건너뜀 (`if: server_restarted` 로 재시작했을 때만 부른다) |
 | `other_server` | scp 업로드 + 원격 명령 |
 | `confluence` | 문서 갱신 |
 | `sync` · `build` · `upload` | 임의 명령 실행 |
 
 ### 조건부 실행
 
-스테이지에 `if:` / `unless:` 를 붙이면 컨텍스트 변수 값에 따라 건너뛴다.
+스테이지에 `if:` / `unless:` 를 붙이면 컨텍스트 변수 값에 따라 건너뛴다. 이름 하나 또는 목록을 받는다.
 
 ```yaml
-- sync_static:
-    if: changed_static_only        # 참일 때만 실행
-- c#_build:
-    unless: changed_static_only    # 참이면 건너뜀
+- static_patch:
+    if: changed_static_only                         # 참일 때만 실행
+- build:
+    unless: changed_static_only                     # 참이면 건너뜀
+- local_deploy:
+    unless: [deploy_remote, changed_static_only]    # 하나라도 참이면 건너뜀
 ```
 
 값이 `false` · `0` · 빈 문자열이면 거짓이다. 조건은 `--dry-run` 계획에 함께 표시된다.
+자세한 규칙은 [정적 파일 빠른 배포](03_정적파일_빠른배포.md#조건부-실행).
 
 ### 실패 처리
 

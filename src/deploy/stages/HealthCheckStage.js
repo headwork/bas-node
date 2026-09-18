@@ -24,8 +24,11 @@ class HealthCheckStage extends BaseStage {
     //   루트의 302 만 확인하면 몇 초 안에 "앱이 떴다"를 판정할 수 있다.
     const followRedirects = stageConfig.follow_redirects !== false;
 
+    // 주소가 없으면 확인하지 않는다. 헬스체크는 **health_url 이 있는 배포대상에서만** 한다 —
+    // 로컬이든 원격이든 같다. 언제 부를지(재시작했을 때만)는 yaml 의 `if: server_restarted` 가 정한다.
     if (!url) {
-      throw new Error("HealthCheckStage requires 'url' (스테이지 설정 또는 health_url 변수).");
+      console.log(`[HealthCheckStage] health_url 이 없어 건너뜁니다.`);
+      return;
     }
 
     console.log(`[HealthCheckStage] Starting health check for ${url}`);

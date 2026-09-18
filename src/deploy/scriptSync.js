@@ -37,6 +37,19 @@ function defaultScriptDir(vars = {}, os = 'windows') {
 }
 
 /**
+ * 원격에 스크립트를 놓는 자리 — `${upload_path}\_scripts\<환경>\windows`.
+ *
+ * **환경마다 따로다.** qa·prod 가 한 서버에서 같은 `upload_path` 를 쓰면 스크립트 폴더가
+ * 하나가 되고, 한쪽이 `deploy.bat` 을 실행하는 중에 다른 쪽이 같은 파일을 덮어쓴다.
+ * cmd 는 bat 을 실행하면서 읽어 가므로, 그 순간에 걸리면 반쪽 파일을 명령으로 읽는다.
+ * 환경을 모르면(옛 호출) 예전 자리를 쓴다.
+ */
+function defaultRemoteScriptDir(uploadPath, environment) {
+  const root = `${String(uploadPath || '').replace(/\//g, '\\')}\\_scripts`;
+  return environment ? `${root}\\${environment}\\windows` : `${root}\\windows`;
+}
+
+/**
  * 스크립트 폴더의 파일 목록. 폴더가 없으면 null (빈 폴더와 구분한다 — 사유가 다르다).
  * 정렬해서 돌려준다: 명령이 실행마다 달라지면 스냅샷으로 죌 수 없다.
  */
@@ -125,4 +138,4 @@ function assertScript(scriptPath, scriptDir) {
   );
 }
 
-module.exports = { syncRemoteScripts, listScripts, assertScript, defaultScriptDir, SCRIPT_EXT };
+module.exports = { syncRemoteScripts, listScripts, assertScript, defaultScriptDir, defaultRemoteScriptDir, SCRIPT_EXT };

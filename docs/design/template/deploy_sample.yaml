@@ -31,7 +31,7 @@ deploy_root: "D:/Deploy"
 # 프로젝트마다 복사하지 않는다 — IIS 프로젝트가 열 개여도 webserver_iis.bat 은 하나다.
 # 프로젝트마다 다른 것(build_*.bat·pubxml)은 profile_dir 쪽에 둔다.
 #
-# 원격 배포는 이 폴더를 **배포서버로 매번 밀어 넣는다**(`${upload_path}/_scripts/windows`).
+# 원격 배포는 이 폴더를 **배포서버로 매번 밀어 넣는다**(`${upload_path}/_scripts/<환경>/windows`).
 # 배포서버에 손으로 올려 둘 필요가 없다. 규약은 docs/design/배포/06_배포_스크립트_규약.md.
 # script_dir: "${tool_home}/script/windows"
 # sync_scripts: false        # 배포서버에 직접 배치했을 때만 끈다. 기본은 전송함
@@ -217,7 +217,7 @@ stages:
   - build:         { group: build }                      # build_cwd·build_cmd·build_profile
   - archive:       { group: build,  if: compress }       # build_path -> _artifacts/<이름>.zip
   - remote_deploy: { group: deploy, if: deploy_remote }  # scp -> 해제 -> 정지 -> 스왑 -> 시작
-  - health_check:  { group: deploy, if: deploy_remote }  # health_url
+  - health_check:  { group: deploy, if: server_restarted }   # 웹서버를 (다시) 띄웠을 때만. health_url 이 없으면 건너뜀
   - local_deploy:  { group: deploy, unless: deploy_remote }
   - confluence:    { group: deploy }                     # confluence: true 인 경우만 동작
 

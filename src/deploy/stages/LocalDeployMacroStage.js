@@ -221,6 +221,9 @@ class LocalDeployMacroStage extends BaseStage {
       throw err;
     }
 
+    // 웹서버를 내렸다 올렸다. health_check 가 이 값을 보고 돈다 (manage_iis:false 면 안 건드렸다).
+    this.engine.context.variables.server_restarted = manageIis;
+
     // 3. 백업 보관 정책 적용 (#P001-OQ2)
     //    정리 실패는 배포 성공을 뒤집지 않는다 — 로그만 남기고 넘어간다.
     console.log(`[LocalDeployMacroStage] Step 3: Applying backup retention policy`);

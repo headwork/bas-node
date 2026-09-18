@@ -104,7 +104,59 @@ class GitSyncStage extends BaseStage {
     const after = this.revParse(buildPath);
     console.log(`[GitSyncStage] Git synchronization completed successfully.`);
 
-    this.classify(buildPath, before, after, staticPaths);
+    // 비교 기준은 **이 환경 라이브에 올라가 있는 커밋**(이력의 마지막 성공 배포)이다.
+    // 동기화 전 HEAD 가 아니다 — 실패한 배포도 폴더는 옮겨 놓으므로, HEAD 를 기준으로 하면
+    // 올라가지 않은 변경이 차이에서 빠진다. 바뀐 파일만 복사하는 정적 배포에서는
+    // 그 파일이 **영영 안 올라간다.** 이력을 기준으로 하면 누적되어 함께 나간다.
+    //
+    // 기준을 못 잡으면 정적 판정을 하지 않는다(전체 배포). 차이 목록은 공지용으로 예전처럼
+    // 동기화 전 HEAD 와 비교해 둔다.
+    const deployed = this.deployedCommit(buildPath);
+    let from = before;
+    let judgeStatic = staticPaths;
+
+    if (deployed.commit) {
+      from = deployed.commit;
+      console.log(`[GitSyncStage] 비교 기준: 이 환경의 마지막 성공 배포 ${deployed.commit.slice(0, 8)} (${deployed.key})`);
+      if (before && before !== deployed.commit) {
+        console.log(`[GitSyncStage]   작업 폴더 HEAD(${before.slice(0, 8)})와 다릅니다 - ` +
+          `이전 배포가 실패했거나 다른 실행이 폴더를 옮겼습니다. 기준부터 누적해서 배포합니다.`);
+      }
+    } else {
+      judgeStatic = null;
+      console.log(`[GitSyncStage] 비교 기준 없음 - ${deployed.why}. 정적 판정 없이 전체 배포합니다.`);
+    }
+
+    this.classify(buildPath, from, after, judgeStatic);
+  }
+
+  /**
+   * 이 환경 라이브의 커밋을 이력에서 찾고, 저장소에 실제로 있는지 확인한다.
+   *
+   * 없으면(강제 푸시로 사라짐 등) 차이를 구할 수 없으므로 기준이 없는 것으로 본다.
+   * @returns {{ commit: string|null, key?: string, why: string }}
+   */
+  deployedCommit(cwd) {
+    const state = this.engine.deployState;
+    if (!state || typeof state.lastDeployedCommit !== 'function') {
+      return { commit: null, why: '배포 이력을 쓸 수 없음(설정 폴더 없음)' };
+    }
+
+    const found = state.lastDeployedCommit(this.engine.context.environment);
+    if (!found.commit) return { commit: null, why: found.why };
+
+    // 상태 파일의 값이 명령줄에 그대로 들어간다. 커밋 모양이 아니면 쓰지 않는다.
+    if (!/^[0-9a-f]{7,40}$/i.test(found.commit)) {
+      return { commit: null, why: `이력의 커밋 값이 올바르지 않음 (${found.commit})` };
+    }
+
+    // `^{commit}` 을 쓰지 않는다 — cmd 에서 `^` 는 이스케이프라 사라진다.
+    const r = this.engine.runCommand(`git cat-file -t ${found.commit}`, cwd, { capture: true, allowFailure: true });
+    if (r.code !== 0 || (r.stdout || '').trim() !== 'commit') {
+      return { commit: null, why: `이력의 커밋 ${found.commit.slice(0, 8)} 이 저장소에 없음` };
+    }
+
+    return { commit: found.commit, key: found.key, why: '' };
   }
 
   revParse(cwd) {

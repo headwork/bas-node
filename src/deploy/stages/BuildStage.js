@@ -131,7 +131,7 @@ class BuildStage extends BaseStage {
       throw new Error(`빌드가 끝났는데 산출물 폴더가 없습니다: ${buildPath}`);
     }
 
-    const newest = this.#newestMtime(buildPath, 0);
+    const newest = this.#newestMtime(buildPath);
     if (newest === 0) {
       throw new Error(`산출물 폴더가 비어 있습니다: ${buildPath}`);
     }
@@ -148,9 +148,14 @@ class BuildStage extends BaseStage {
     console.log(`[BuildStage] 산출물 확인됨 (최종 수정 ${new Date(newest).toLocaleString()})`);
   }
 
-  /** 하위를 훑어 가장 최근 수정시각을 찾는다. 깊이를 제한해 비용을 묶는다. */
-  #newestMtime(dir, depth) {
-    if (depth > 3) return 0;
+  /**
+   * 하위를 끝까지 훑어 가장 최근 수정시각을 찾는다.
+   *
+   * ⚠️ 깊이를 제한하지 않는다. 예전에는 3단계에서 멈췄는데, 바뀐 파일이
+   *    `Views\ERP\FI\VL\*.cshtml` (4단계)에 있으면 **아예 보지 않고** "갱신 안 됨" 으로
+   *    판정했다(2026-09-18 dev #9). 게시 산출물은 수천 개 수준이라 끝까지 봐도 싸다.
+   */
+  #newestMtime(dir) {
     let newest = 0;
     let entries;
     try {
@@ -162,7 +167,7 @@ class BuildStage extends BaseStage {
       const full = path.join(dir, entry.name);
       try {
         if (entry.isDirectory()) {
-          newest = Math.max(newest, this.#newestMtime(full, depth + 1));
+          newest = Math.max(newest, this.#newestMtime(full));
         } else {
           newest = Math.max(newest, fs.statSync(full).mtimeMs);
         }

@@ -36,6 +36,7 @@ const OtherServerStage = require('./stages/OtherServerStage');
 const RemoteDeployMacroStage = require('./stages/RemoteDeployMacroStage');
 const RemoteRollbackMacroStage = require('./stages/RemoteRollbackMacroStage');
 const ConfluenceStage = require('./stages/ConfluenceStage');
+const StaticPatchStage = require('./stages/StaticPatchStage');
 const notify = require('./notify');
 
 class PipelineEngine {
@@ -79,6 +80,8 @@ class PipelineEngine {
       'other_server': new OtherServerStage(this),
       'remote_deploy': new RemoteDeployMacroStage(this),
       'remote_rollback': new RemoteRollbackMacroStage(this),
+      // 정적 파일만 바뀐 배포. 빌드·정지·스왑 없이 바뀐 파일만 덮어쓴다 (로컬·원격 공용)
+      'static_patch': new StaticPatchStage(this),
       'confluence': new ConfluenceStage(this)
     };
   }
@@ -333,6 +336,18 @@ class PipelineEngine {
     const stages = Array.isArray(doc.rollback) ? doc.rollback : (doc.rollback.stages || []);
     for (const stage of stages) {
       await this.executeStage(stage, basePath);
+    }
+
+    // 라이브가 옛 백업으로 돌아갔다. 이력의 마지막 성공 커밋은 이제 라이브를 설명하지 못하므로
+    // 다음 배포가 그것을 비교 기준으로 쓰면 안 된다 — 표식을 남겨 전체 배포로 돌린다.
+    // **성공했을 때만** 남긴다. 실패(1)면 라이브는 그대로라 기준도 그대로 맞다.
+    if (this.deployState) {
+      this.deployState.recordRollback({
+        key: options.key || `rollback-${this.context.environment}-${Date.now()}`,
+        environment: this.context.environment,
+        lastDeploy
+      });
+      console.log(`[Rollback] 이력에 기록했습니다 - 다음 배포는 전체 배포로 진행됩니다.`);
     }
     return { rolledBack: true };
   }
@@ -659,10 +674,15 @@ class PipelineEngine {
           (stageConfig && typeof stageConfig === 'object' && stageConfig.chain);
         if (!known) unknown.push(stageName);
 
+        // if 와 unless 를 함께 쓸 수 있다 — 둘 다 보여야 계획이 실행과 맞는다.
         let cond = '';
         if (stageConfig && typeof stageConfig === 'object') {
-          if (stageConfig.if !== undefined) cond = `   [조건] ${stageConfig.if} 이 참일 때만`;
-          else if (stageConfig.unless !== undefined) cond = `   [조건] ${stageConfig.unless} 이 참이면 건너뜀`;
+          const list = (v) => (Array.isArray(v) ? v.join(' 그리고 ') : v);
+          const any = (v) => (Array.isArray(v) ? v.join(' 또는 ') : v);
+          const parts = [];
+          if (stageConfig.if !== undefined) parts.push(`${list(stageConfig.if)} 이 참일 때만`);
+          if (stageConfig.unless !== undefined) parts.push(`${any(stageConfig.unless)} 이 참이면 건너뜀`);
+          if (parts.length) cond = `   [조건] ${parts.join(', ')}`;
         }
         console.log(`\n  ${index + 1}. ${stageName}${known ? '' : '   <-- 등록되지 않은 스테이지'}${cond}`);
         if (stageConfig && typeof stageConfig === 'object') {
@@ -707,13 +727,24 @@ class PipelineEngine {
     return s !== '' && s !== 'false' && s !== '0';
   }
 
-  /** 건너뛸 사유를 돌려준다. 실행해야 하면 null. */
+  /**
+   * 건너뛸 사유를 돌려준다. 실행해야 하면 null.
+   *
+   * 이름 하나 또는 목록을 받는다.
+   *   if:     [a, b]   전부 참일 때만 실행
+   *   unless: [a, b]   하나라도 참이면 건너뜀
+   * 목록이 필요한 이유: `local_deploy` 는 원격이 아닐 때 **그리고** 정적 배포가 아닐 때만
+   * 돌아야 하는데, yaml 키는 하나라 조건 이름을 둘 적을 자리가 없었다.
+   */
   shouldSkip(stageName, stageConfig) {
-    if (stageConfig.if !== undefined && !this.isTruthy(stageConfig.if)) {
-      return `조건 '${stageConfig.if}' 이 거짓`;
+    const names = (v) => (Array.isArray(v) ? v : [v]);
+    if (stageConfig.if !== undefined) {
+      const off = names(stageConfig.if).filter(n => !this.isTruthy(n));
+      if (off.length > 0) return `조건 '${off.join(', ')}' 이 거짓`;
     }
-    if (stageConfig.unless !== undefined && this.isTruthy(stageConfig.unless)) {
-      return `조건 '${stageConfig.unless}' 이 참`;
+    if (stageConfig.unless !== undefined) {
+      const on = names(stageConfig.unless).filter(n => this.isTruthy(n));
+      if (on.length > 0) return `조건 '${on.join(', ')}' 이 참`;
     }
     return null;
   }

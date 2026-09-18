@@ -1,7 +1,7 @@
 const BaseStage = require('./BaseStage');
 const path = require('path');
 const { makeSshRunner } = require('../sshRunner');
-const { syncRemoteScripts, defaultScriptDir } = require('../scriptSync');
+const { syncRemoteScripts, defaultScriptDir, defaultRemoteScriptDir } = require('../scriptSync');
 const { ROLLBACK, reasonFor } = require('../scriptExit');
 const { assertRemotePath } = require('../remoteEnv');
 const { joinPreserve } = require('../scriptArgs');
@@ -51,7 +51,7 @@ class RemoteRollbackMacroStage extends BaseStage {
     const wsType = cfg('web_server_type') || 'iis';
     const manageIis = config.manage_iis !== false && cfg('web_server_type') !== 'none';
     const scriptDir = cfg('remote_script_dir')
-      || `${String(cfg('upload_path') || '').replace(/\//g, '\\')}\\_scripts\\windows`;
+      || defaultRemoteScriptDir(cfg('upload_path'), this.engine.context.environment);
     // 도구 서버의 원본 자리 (#P002-TASK5). 배포 매크로와 같은 값을 본다.
     const localScriptDir = cfg('script_dir') || defaultScriptDir(vars);
 

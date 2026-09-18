@@ -135,9 +135,13 @@ function openState(args, doc, environment) {
     return { state: null, config: null };
   }
 
-  const statePath = resolveStatePath(config, args.yamlFile);
-  const base = path.basename(statePath, '.json');
-  const lockPath = path.join(path.dirname(statePath), `${base}.${environment}.lock`);
+  // 상태 파일도 락처럼 **환경별**이다. 락이 환경별이라 qa·prod 가 동시에 도는데,
+  // 파일이 하나면 서로의 기록을 덮어쓴다(DeployState 생성자 주석).
+  // 환경을 가르기 전의 공용 파일은 이 환경 파일이 없을 때 한 번 읽어 옮긴다.
+  const legacyPath = resolveStatePath(config, args.yamlFile);
+  const base = path.basename(legacyPath, '.json');
+  const statePath = path.join(path.dirname(legacyPath), `${base}.${environment}.json`);
+  const lockPath = path.join(path.dirname(legacyPath), `${base}.${environment}.lock`);
 
   // config 를 함께 돌려준다 — 공지(텔레그램) 설정이 여기 들어 있고,
   // 엔진은 자기가 설정을 읽지 않는다(부르는 쪽이 넘긴다).
@@ -145,6 +149,8 @@ function openState(args, doc, environment) {
     state: new DeployState({
       statePath,
       lockPath,
+      legacyPath,
+      environment,
       keep: config.get('deploy.state_keep', 10),
       ttlMinutes: config.get('deploy.lock_ttl_min', 60)
     }),
@@ -243,7 +249,8 @@ async function main() {
       await engine.runRollback(yamlPath, args.params, {
         dryRun: args.dryRun,
         lastDeploy: args.rollback,
-        state
+        state,
+        key: rollbackKey
       });
     } catch (err) {
       console.error(`\n[Rollback] 실패: ${err.message}`);

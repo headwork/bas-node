@@ -16,11 +16,26 @@ const COMMON = {
   4: '대상을 찾을 수 없습니다 (사이트·서비스 이름, 또는 어댑터 스크립트가 없음)'
 };
 
-/** `webserver_<type>.bat` — 정지·기동. */
+/** `webserver_<type>.bat` — 정지·기동·상태. */
 const WEBSERVER = {
   ...COMMON,
   1: '알 수 없는 실패',
-  5: '실패했고 되돌리지도 못했습니다 - 라이브 폴더가 없습니다. 사람이 고쳐야 합니다'
+  5: '실패했고 되돌리지도 못했습니다 - 라이브 폴더가 없습니다. 사람이 고쳐야 합니다',
+  // `status` 에서만 나온다. 실패가 아니라 답이다.
+  6: '웹서버가 실행 중이 아닙니다'
+};
+
+/**
+ * `patch.bat` — 정적 배포. 바뀐 파일만 라이브에 덮어쓴다. 정지도 스왑도 없다.
+ *
+ * ⚠️ `6` 은 **성공**이다. 서버가 멈춰 있어 시작했다는 뜻이고, 그때만 헬스체크를 한다.
+ *    출력을 파싱하지 않으려고 코드로 받는다.
+ */
+const PATCH = {
+  ...COMMON,
+  1: '정적 파일 복사 실패 - 일부 파일은 이미 라이브에 들어갔을 수 있습니다. 다음 배포가 같은 범위를 다시 복사합니다',
+  4: '라이브 폴더를 찾을 수 없습니다 (또는 웹서버 대상·어댑터 스크립트가 없음)',
+  6: '복사함 - 웹서버가 멈춰 있어 시작했습니다'
 };
 
 /**
@@ -54,4 +69,4 @@ function reasonFor(table, code) {
   return table[code] || `알 수 없는 종료코드 ${code}`;
 }
 
-module.exports = { COMMON, WEBSERVER, DEPLOY, ROLLBACK, reasonFor };
+module.exports = { COMMON, WEBSERVER, DEPLOY, ROLLBACK, PATCH, reasonFor };

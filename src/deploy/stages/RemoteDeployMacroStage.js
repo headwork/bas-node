@@ -3,7 +3,7 @@ const path = require('path');
 const { stampNow, backupName, selectFromNames, selectLeftovers } = require('../backupRetention');
 const { decideConfigSource, formatDecision, ticksToEpochMs } = require('../configPreserve');
 const { makeSshRunner } = require('../sshRunner');
-const { syncRemoteScripts, defaultScriptDir } = require('../scriptSync');
+const { syncRemoteScripts, defaultScriptDir, defaultRemoteScriptDir } = require('../scriptSync');
 const { DEPLOY, reasonFor } = require('../scriptExit');
 const { assertRemotePath } = require('../remoteEnv');
 const { joinPreserve } = require('../scriptArgs');
@@ -78,10 +78,9 @@ class RemoteDeployMacroStage extends BaseStage {
     // 기존 YAML 이 수정 없이 그대로 돌아야 한다 (#P002-REQ5).
     const wsType = cfg('web_server_type') || 'iis';
     const wsPool = cfg('web_server_pool');
-    // 원격 스크립트가 놓이는 자리. upload_path 가 이미 프로젝트별이라 격리가 따라온다.
-    // ⚠️ `win()` 은 아래에서 선언되므로 여기서 부르면 TDZ 다. 직접 바꾼다.
+    // 원격 스크립트가 놓이는 자리. 환경마다 따로다 — 이유는 defaultRemoteScriptDir 에.
     const scriptDir = cfg('remote_script_dir')
-      || `${String(uploadPath).replace(/\//g, '\\')}\\_scripts\\windows`;
+      || defaultRemoteScriptDir(uploadPath, this.engine.context.environment);
     // 그 원본이 있는 **도구 서버** 폴더. 로컬 매크로가 쓰는 값과 같은 것이다 —
     // 스크립트는 한 벌이고, 원격이냐 로컬이냐는 실행 경로의 차이일 뿐이다.
     const localScriptDir = cfg('script_dir') || defaultScriptDir(vars);
@@ -292,6 +291,9 @@ class RemoteDeployMacroStage extends BaseStage {
       }
       throw new Error(`원격 배포 실패: ${why} (종료코드 ${r.code})`);
     }
+
+    // 웹서버를 내렸다 올렸다. health_check 가 이 값을 보고 돈다 (manage_iis:false 면 안 건드렸다).
+    vars.server_restarted = manageIis;
 
     // 7. 원격 백업 정리. 로컬과 같은 정책(`backup.keep_count`)을 쓴다.
     //    원격은 아무도 훑지 않아 배포마다 690MB 가 무한히 쌓이던 자리다.
