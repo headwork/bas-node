@@ -78,23 +78,27 @@ function getJsFiles(dir) {
     return results;
 }
 
+/*
+    dist 는 배포 패키지 전체다 — 번들 + bundle_config/deploy 의 정적 파일(런처·스크립트·설정·LICENSE).
+    통째로 지우고 다시 만든다. dist 에 손으로 넣은 파일은 다음 빌드에서 사라진다.
+
+    예전에는 "지우면 안 되는 것"(config·.bat)을 골라 남겼는데, 그 목록에 없는
+    LICENSE 가 빌드마다 지워졌다(2026-09-18). 남길 것을 고르는 대신 원본을 따로 두고 복사한다.
+
+    ⚠️ webpack 의 output.clean 을 쓰지 않는다. emit 시점에 webpack 이 만들지 않은 파일을
+       지우므로, 여기서 복사한 파일이 같이 사라진다.
+*/
 function cleanFile(){
-    let distPath = pjtPath + "\\dist";
-    if (!fs.existsSync(distPath)) return;
+    const distPath = path.join(pjtPath, "dist");
+    fs.rmSync(distPath, { recursive: true, force: true });
+    console.log("clean = " + distPath);
+}
 
-    // 지우면 안 되는 것: 설정 폴더와 실행 런처.
-    //
-    // ⚠️ 예전에는 new RegExp("config|.+\.bat", "g") 를 test() 로 돌렸는데,
-    //    g 플래그가 붙은 정규식의 test() 는 lastIndex 를 전진시켜 호출마다
-    //    결과가 달라진다. 그래서 보호 대상이 순서에 따라 삭제됐다 —
-    //    실제로 dist/config 가 통째로 날아갔다. 상태 없는 판정으로 바꾼다.
-    const keep = file => file === "config" || file.toLowerCase().endsWith(".bat");
-
-    fs.readdirSync(distPath).forEach(file => {
-        if (keep(file)) return;
-        console.log("clean = " + file);
-        fs.rmSync(path.join(distPath, file), { recursive: true, force: true });
-    });
+function copyStatic(){
+    const src = path.join(pjtPath, "bundle_config", "deploy");
+    const dest = path.join(pjtPath, "dist");
+    fs.cpSync(src, dest, { recursive: true });
+    console.log("copy = " + src + " -> " + dest);
 }
 
 /*
@@ -129,6 +133,7 @@ module.exports = (env, argv) => {
       //...
     }
     cleanFile();
+    copyStatic();
     config = merge(config, makerHlngOptions());
 
     return config;

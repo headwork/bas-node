@@ -76,7 +76,7 @@ function syncRemoteScripts(engine, { ssh, localDir, remoteDir, target, port, key
     throw new Error(
       `스크립트 폴더가 없습니다: ${localDir}\n` +
       `  배포서버 제어용 공용 스크립트(deploy.bat · webserver_<type>.bat)를 이 자리에 두십시오.\n` +
-      `  원본은 저장소의 docs/design/template/windows/ 에 있습니다. (${GUIDE})`
+      `  원본은 저장소의 bundle_config/deploy/script/windows/ 에 있고, 빌드하면 dist 에 함께 담깁니다. (${GUIDE})`
     );
   }
   if (names.length === 0) {
@@ -121,7 +121,7 @@ function assertScript(scriptPath, scriptDir) {
     `배포 스크립트를 찾을 수 없습니다: ${scriptPath}\n` +
     `  찾은 폴더 : ${scriptDir}\n` +
     `  yaml 의 script_dir 로 폴더를 지정하거나, 도구 옆 script/windows 에 두십시오.\n` +
-    `  원본은 저장소의 docs/design/template/windows/ 에 있습니다. (${GUIDE})`
+    `  원본은 저장소의 bundle_config/deploy/script/windows/ 에 있고, 빌드하면 dist 에 함께 담깁니다. (${GUIDE})`
   );
 }
 

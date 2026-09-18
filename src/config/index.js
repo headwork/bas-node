@@ -46,11 +46,14 @@ function resolveConfigDir(explicit) {
   //   번들: <bundle>/bas-deploy.js  -> __dirname = <bundle>
   //   소스: <repo>/src/config/      -> __dirname = <repo>/src/config
   // 양쪽을 모두 후보에 넣는다. 하나만 넣으면 다른 쪽에서 설정을 통째로 못 찾는다.
+  //
+  // 소스 쪽은 dist 가 아니라 **원본**(bundle_config/deploy/config)을 본다. dist 는 빌드마다
+  // 통째로 지우고 복사하는 사본이라, 빌드 전에는 없고 거기서 고친 값은 다음 빌드에 사라진다.
   const candidates = [
     path.join(__dirname, 'config'),                     // 번들: <bundle>/config
     path.join(__dirname, '..', 'config'),
     path.join(__dirname, '..', '..', 'config'),
-    path.join(__dirname, '..', '..', 'dist', 'config'), // 소스: <repo>/dist/config
+    path.join(__dirname, '..', '..', 'bundle_config', 'deploy', 'config'), // 소스: <repo>/bundle_config/deploy/config
     path.join(process.cwd(), 'config'),
   ].map(p => path.resolve(p));
 
@@ -59,7 +62,7 @@ function resolveConfigDir(explicit) {
   // 존재만으로 고르면 **소스 실행에서 로더 자신의 폴더가 먼저 걸린다.**
   // `<repo>/src/config` 는 이 파일이 사는 자리고 설정이 하나도 없는데,
   // `path.join(__dirname,'..','config')` 가 정확히 그 경로라 항상 이긴다.
-  // 그러면 뒤에 있는 `<repo>/dist/config` 는 영영 후보에 오르지 못하고,
+  // 그러면 뒤에 있는 `<repo>/bundle_config/deploy/config` 는 영영 후보에 오르지 못하고,
   // 배포는 **에러 없이** 상태기록 없는 폴백으로 떨어진다(2026-09-01 실측).
   //
   // 그래서 app.json 이 실제로 있는 폴더를 1순위로 본다. 없으면 존재하는 첫 폴더로
