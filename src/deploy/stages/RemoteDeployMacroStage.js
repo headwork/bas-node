@@ -6,6 +6,7 @@ const { makeSshRunner } = require('../sshRunner');
 const { syncRemoteScripts, defaultScriptDir, defaultRemoteScriptDir } = require('../scriptSync');
 const { DEPLOY, reasonFor } = require('../scriptExit');
 const { assertRemotePath } = require('../remoteEnv');
+const { reportLockHolders } = require('../lockDiag');
 const { joinPreserve } = require('../scriptArgs');
 
 /**
@@ -284,6 +285,10 @@ class RemoteDeployMacroStage extends BaseStage {
       console.error(`\n[RemoteDeploy] 배포 실패 - ${siteName}`);
       console.error(`  사유     : ${why}`);
       console.error(`  종료코드 : ${r.code}`);
+      // 폴더를 옮기지 못한 실패(`1`)는 대개 **누가 잡고 있어서**다. 누구인지 여기서 묻는다 —
+      // 사람이 원격에 들어가 짐작으로 찾던 자리다 (#P003-TASK2).
+      // 진단이 실패해도 배포 결과는 이미 정해졌다. reportLockHolders 는 던지지 않는다.
+      if (r.code === 1) reportLockHolders(ssh, livePath);
       if (r.code === 5) {
         // 스크립트가 원복까지 실패한 자리. 사람이 칠 명령을 그대로 적어 준다.
         console.error(`  ⚠️ 라이브 폴더가 없습니다. 원격에서 직접 실행하십시오:`);

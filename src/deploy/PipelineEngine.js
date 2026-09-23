@@ -26,6 +26,7 @@ const HealthCheckStage = require('./stages/HealthCheckStage');
 const BackupCleanupStage = require('./stages/BackupCleanupStage');
 const ArchiveStage = require('./stages/ArchiveStage');
 const { collectSecretKeys, maskVariables, maskUrlCredentials } = require('./maskSecrets');
+const { decodeOutput } = require('./decodeOutput');
 
 // Macro Stages
 const GitSyncStage = require('./stages/GitSyncStage');
@@ -879,7 +880,8 @@ class PipelineEngine {
     }
     if (options.capture) {
       execOptions.stdio = ['ignore', 'pipe', 'pipe'];
-      execOptions.encoding = 'utf8';
+      // ⚠️ `encoding` 을 주지 않는다 — 주면 **UTF-8 로 고정 해석**되고, 원격 cmd 가 내는
+      //    CP949 한글이 그 자리에서 깨진다. 버퍼로 받아 decodeOutput 이 판정한다 (#P003-TASK3).
     } else {
       execOptions.stdio = 'inherit';
     }
@@ -890,14 +892,14 @@ class PipelineEngine {
     try {
       const stdout = child_process.execSync(cmd, execOptions);
       if (options.capture) {
-        const out = stdout || '';
+        const out = decodeOutput(stdout);
         return { code: 0, stdout: out, stderr: '', output: out };
       }
       return { code: 0 };
     } catch (e) {
       if (options.capture && options.allowFailure) {
-        const stdout = e.stdout || '';
-        const stderr = e.stderr || '';
+        const stdout = decodeOutput(e.stdout);
+        const stderr = decodeOutput(e.stderr);
         return {
           code: e.status === undefined ? -1 : e.status,
           stdout, stderr,
@@ -911,7 +913,7 @@ class PipelineEngine {
       console.error(`- Directory: ${cwd || 'default'}`);
       console.error(`- Status Code: ${e.status}`);
       if (e.stderr) {
-        console.error(`- Error Output:\n${e.stderr.toString()}`);
+        console.error(`- Error Output:\n${decodeOutput(e.stderr)}`);
       } else {
         console.error(`- Message: ${e.message}`);
       }

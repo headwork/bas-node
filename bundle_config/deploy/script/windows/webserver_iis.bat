@@ -12,6 +12,8 @@ rem                status changes nothing: 0 = site AND pool Started,
 rem                6 = either one is not (patch.bat starts it then)
 rem    WS_NAME     IIS site name              (required)
 rem    WS_POOL     app pool name              (optional, defaults to WS_NAME)
+rem    WS_WP_WAIT  seconds to wait for w3wp to exit after a stop
+rem                (optional, default 15) - see :wait_wp for why
 rem    DRY_RUN     1 = print plan, change nothing
 rem
 rem  EXIT CODES - this table is the contract with Node. Do not add codes
@@ -75,6 +77,7 @@ rem :propagate keeps the real code, because that line is parsed after the jump.
     if errorlevel 1 goto :propagate
     call :ensure apppool Stopped
     if errorlevel 1 goto :propagate
+    call :wait_wp
     exit /b 0
 
 :act_start
@@ -206,6 +209,53 @@ rem ---------------------------------------------------------------------------
 :ensure_absent
     echo [webserver] %KIND% not found: %WS_OBJ%
     endlocal & exit /b 4
+
+
+rem ---------------------------------------------------------------------------
+rem  :wait_wp  - wait until the pool's worker processes are really gone
+rem
+rem  `appcmd stop apppool` returns as soon as the pool STATE is Stopped, but
+rem  w3wp.exe lives a little longer while it unloads. Its handles on the
+rem  deployed DLLs live exactly as long as it does, so a deploy that moves or
+rem  overwrites the folder in that window fails with "Access is denied" - which
+rem  is what happened to MFM.SHORE_QA on 2026-09-22 (stop and move landed in the
+rem  same second). Waiting here fixes it for every caller: deploy and patch both
+rem  go through stop.
+rem
+rem  Never fails. A pool that will not let go is not this script's call to make -
+rem  the caller's own error is more informative than a timeout here, and failing
+rem  would turn a slow shutdown into a failed deploy.
+rem
+rem  WS_WP_WAIT   seconds to wait (default 15)
+rem
+rem  `ping` instead of `timeout`: timeout refuses to run when stdin is
+rem  redirected ("ERROR: Input redirection is not supported"), which is exactly
+rem  how this script runs over ssh.
+rem ---------------------------------------------------------------------------
+:wait_wp
+    if "%DRY_RUN%"=="1" (
+        echo [webserver] DRY_RUN wait for worker processes of %WS_POOL%
+        exit /b 0
+    )
+
+    set "WP_LEFT=%WS_WP_WAIT%"
+    if not defined WP_LEFT set "WP_LEFT=15"
+
+:wait_wp_loop
+    set "WP_FOUND="
+    rem Same outer-quote trick as :target_of - without it `for /f` sees nothing
+    rem and every pool looks idle.
+    for /f "delims=" %%A in ('""%APPCMD%" list wp /apppool.name:"%WS_POOL%" 2>nul"') do set "WP_FOUND=1"
+    if not defined WP_FOUND exit /b 0
+
+    if %WP_LEFT% LEQ 0 (
+        echo [webserver] WARNING worker process of %WS_POOL% still running - continuing anyway
+        exit /b 0
+    )
+
+    ping -n 2 127.0.0.1 > nul
+    set /a WP_LEFT-=1
+    goto :wait_wp_loop
 
 
 rem ---------------------------------------------------------------------------

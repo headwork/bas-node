@@ -4,6 +4,7 @@ const { decideConfigSource, formatDecision } = require('../configPreserve');
 const { DEPLOY, reasonFor } = require('../scriptExit');
 const { joinPreserve } = require('../scriptArgs');
 const { assertScript, defaultScriptDir } = require('../scriptSync');
+const { reportLockHolders } = require('../lockDiag');
 const path = require('path');
 const fs = require('fs');
 
@@ -211,6 +212,10 @@ class LocalDeployMacroStage extends BaseStage {
       console.error(`\n[LocalDeployMacroStage] 배포 실패 - ${siteName}`);
       console.error(`  사유     : ${why}`);
       console.error(`  종료코드 : ${r.code}`);
+      // 폴더를 옮기지 못한 실패(`1`)는 대개 누가 잡고 있어서다. 누구인지 묻는다 (#P003-TASK2).
+      if (r.code === 1) {
+        reportLockHolders((cmd, opts) => this.engine.runCommand(cmd, basePath, opts), deployPath);
+      }
       const err = new Error(`로컬 배포 실패: ${why} (종료코드 ${r.code})`);
       if (r.code === 5) {
         console.error(`  ⚠️ 라이브 폴더가 없습니다. 직접 실행하십시오:`);
