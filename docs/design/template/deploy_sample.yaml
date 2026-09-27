@@ -191,15 +191,25 @@ config_backup: "${backup_root}/config/${environment}"
 # ⚠️ 이름에 **공백·쉼표·세미콜론·와일드카드를 쓰지 않는다.** 스크립트가 그 자리에서
 #    목록을 쪼개므로 이름이 갈라지고, 갈라진 이름은 "이전 배포본에 없음" 으로
 #    건너뛰어진다 — **배포는 성공하고 데이터만 사라진다.** 도구가 조립할 때 막는다.
-# preserve:
-#   - "uploads"
-#   - "Temp"
-
-# 백업 보관 정책. 배포 성공 직후 자동 적용된다 (로컬·원격 모두).
-# 이 개수가 곧 `--rollback=N` 의 N 상한이다 — 남기지 않은 것은 되돌릴 수 없다.
 #
-# ⚠️ 백업 폴더명은 라이브 폴더명에서 파생된다(<라이브명>_backup_<시각>).
-#    여러 파이프라인이 같은 backup_root 를 공유하면 서로의 백업을 정리 대상으로 본다.
+# 분류가 용도를 가른다. 옛 평면 목록(preserve: [...])과 preserve_config 도 그대로 받는다.
+# preserve:
+#   temp:   ["Temp"]                            # 임시 - 백업하고 이월한다
+#   data:   ["uploads"]                         # 운영 데이터 - 같다
+#   config: ["web.config", "appsettings.json"]  # 설정 - 산출물이 덮지 못하게 제외한다
+
+# 배포 방식 (#P202609_003). 생략하면 copy 다. --mode 가 이것을 덮는다.
+#   copy  기존 폴더에 덮어쓴다. 폴더를 rename 하지 않아 **누가 열고 있어도 배포된다**
+#   swap  폴더를 갈아끼운다. 정지 구간이 짧고 지워진 파일이 사라지지만, 잠겨 있으면 막힌다
+# 대상마다 다르게 주려면 server_list 의 각 블록 안에 둔다 — 최상위에 두면 전 환경이 같아진다.
+# deploy_mode: "swap"
+
+# 백업 보관 정책. 확정(confirm) 단계에서 적용된다 (로컬·원격 모두).
+# 이 개수가 곧 `--rollback=N` 의 N 상한이다 — 남기지 않은 것은 되돌릴 수 없다.
+# 유지파일 백업과 확정 zip 에 **함께** 걸린다 — 따로 두면 짝이 깨진다.
+#
+# 백업은 `<backup_root>/<web_server_name>/` 밑에 모인다 — 도구가 한 겹 판다.
+# ⚠️ 그러므로 **backup_root 에 프로젝트 이름을 넣지 않는다.** 넣으면 두 겹이 된다.
 backup:
   keep_count: 3
   dry_run: false           # true 로 두면 삭제 대상만 출력하고 지우지 않는다
@@ -212,20 +222,28 @@ backup:
 # 각 단계의 성공/실패가 stage view 에 그대로 보인다.
 # 같은 --deploy-key 를 넘겨야 앞 단계의 판정(changed_static_only 등)이 이어진다.
 # ─────────────────────────────────────────────────────────────────────────────
+#
+# ⚠️ **순서를 지킨다.** health_check 는 배포 스테이지들 **뒤**여야 하고, confirm 은 그 뒤다.
+#    health_check 를 local_deploy 앞에 두면 `server_restarted` 가 아직 서 있지 않아
+#    **조용히 건너뛴다** — 설정은 돼 있는데 한 번도 안 도는 모양이 된다.
 stages:
   - git_sync:      { group: git_check }                  # branch·source_path 를 읽어 동기화
   - build:         { group: build }                      # build_cwd·build_cmd·build_profile
   - archive:       { group: build,  if: compress }       # build_path -> _artifacts/<이름>.zip
-  - remote_deploy: { group: deploy, if: deploy_remote }  # scp -> 해제 -> 정지 -> 스왑 -> 시작
-  - health_check:  { group: deploy, if: server_restarted }   # 웹서버를 (다시) 띄웠을 때만. health_url 이 없으면 건너뜀
+  - remote_deploy: { group: deploy, if: deploy_remote }  # scp -> 해제 -> 정지 -> 교체 -> 시작
   - local_deploy:  { group: deploy, unless: deploy_remote }
+  - health_check:  { group: deploy, if: server_restarted }   # 웹서버를 (다시) 띄웠을 때만. health_url 이 없으면 건너뜀
+  - confirm:       { group: deploy }                     # 확정. **헬스체크 뒤여야 한다**
   - confluence:    { group: deploy }                     # confluence: true 인 경우만 동작
 
-# 배포가 실패하면 실행된다. 백업 폴더로 라이브를 되돌린다.
-# 백업이 없으면(라이브를 건드리기 전에 실패) 아무것도 하지 않는다.
+# 배포가 실패하면 실행된다 (트랙 A). 되돌릴 원본은 스왑이 밀어낸 <라이브>_org_<시각>
+# 이거나, 그것이 없으면(copy 모드) 직전 확정 zip 이다.
+# 라이브를 건드리기 전에 실패했으면 아무것도 하지 않는다.
 #
-#   basDeploy.bat --yaml=... --rollback=1     1 = 직전 성공 배포 (최대 backup.keep_count)
-#   basDeploy.bat --yaml=... --rollback=1 --dry-run    되돌릴 후보만 출력
+# 사람이 부르는 롤백(트랙 B)은 확정 zip 을 다시 전개한다 — 배포와 같은 길이다.
+#   basDeploy.bat --yaml=... --rollback=1     1 = 직전 확정 배포 (최대 backup.keep_count)
+#   basDeploy.bat --yaml=... --rollback=2 --dry-run    되돌릴 후보만 출력
+# 확정된 배포가 없으면 "확정 빌드가 없습니다" 로 멈춘다 — 첫 배포에는 되돌릴 곳이 없다.
 rollback:
   - local_rollback:  { unless: deploy_remote }
   - remote_rollback: { if: deploy_remote }

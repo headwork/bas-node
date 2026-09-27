@@ -8,7 +8,7 @@
 |---|---|---|
 | [P202608_001](features/P202608_001_jenkins_deploy_enhancement/spec.md) | Jenkins 배포기능 고도화 | 🟢 완료 |
 | [P202609_002](features/P202609_002_deploy_target_abstraction/spec.md) | 배포 대상 범용화 (OS · 웹서버 추상화) | 🟡 진행중 |
-| [P202609_003](features/P202609_003_deploy_mode_option/spec.md) | 배포 방식 옵션화 (복사 · 스왑) + preserve 분류 | 🟡 기획 |
+| [P202609_003](features/P202609_003_deploy_mode_option/spec.md) | 배포 방식 옵션화 (복사 · 스왑) + preserve 분류 | 🟢 완료 |
 
 ## 참고 자료 (references)
 
@@ -24,3 +24,6 @@
 |---|---|
 | #P202609_003 | 운영 데이터(`data` 분류) 별도 백업 체계 — 배포마다 복사하기에는 크다 |
 | #P202609_003 | 확정 zip 을 도구 서버에도 보관할지 — 현재 안은 배포서버 한 곳 |
+| #P202609_003 | clean 빌드 옵션 (OQ4 — 도구는 검사하지 않기로 했고, 옵션은 별건) |
+| #P202609_003 | 델타 건수를 로그에 남기기 — 지금은 `robocopy > nul` 이라 0건인지 5건인지 구분이 안 된다 |
+| #P202609_003 | 배포 서버의 옛 잔재 정리 — `backup\MFM.SHORE_QA\` 의 9/17·9/18 폴더 2건(대문자 접두어라 자동 정리 대상 아님) |

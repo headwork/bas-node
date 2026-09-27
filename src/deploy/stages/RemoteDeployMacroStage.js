@@ -1,13 +1,15 @@
 const BaseStage = require('./BaseStage');
 const path = require('path');
-const { stampNow, backupName, selectFromNames, selectLeftovers } = require('../backupRetention');
+const { stampNow, stagingName, orgName, preserveName, backupDirFor } = require('../backupRetention');
+const { resolveDeployMode } = require('../deployMode');
+const { classifyPreserve, allNames } = require('../preserveClassify');
+const { preserveScriptArgs } = require('../scriptArgs');
 const { decideConfigSource, formatDecision, ticksToEpochMs } = require('../configPreserve');
 const { makeSshRunner } = require('../sshRunner');
 const { syncRemoteScripts, defaultScriptDir, defaultRemoteScriptDir } = require('../scriptSync');
-const { DEPLOY, reasonFor } = require('../scriptExit');
+const { deployReason } = require('../scriptExit');
 const { assertRemotePath } = require('../remoteEnv');
 const { reportLockHolders } = require('../lockDiag');
-const { joinPreserve } = require('../scriptArgs');
 
 /**
  * 원격 서버 배포 매크로. local_deploy 와 같은 순서를 SSH 너머에서 수행한다.
@@ -96,13 +98,29 @@ class RemoteDeployMacroStage extends BaseStage {
     const stamp = stampNow();
     const livePath = win(deployPath);
 
-    // 백업은 `backup_root` 에 모은다. 지정하지 않으면 라이브 옆에 만든다.
+    // 배포 방식. **기본은 copy** — 운영이 오래 써 온 방식이고, 폴더 잠금에 강하다 (#P003-REQ1).
+    // 규칙은 deployMode.js 한 곳에 있다. 여기서 다시 적으면 요약 로그와 갈린다.
+    const { mode } = resolveDeployMode({
+      override: vars.deploy_mode_override, stageConfig, vars
+    });
+
+    // 백업은 `backup_root` **밑에 웹서버 이름으로 한 겹 파고** 모은다 (#P003).
+    // 루트를 여러 프로젝트가 나눠 쓰면 사람이 그 폴더를 열었을 때 뭘 지워도 되는지
+    // 판단이 안 선다 — 그 판단은 대개 급할 때 해야 한다.
     // ⚠️ 라이브와 같은 볼륨이어야 한다 — cmd 의 move 도 볼륨이 다르면 복사가 된다.
-    const backupRoot = cfg('backup_root') ? win(cfg('backup_root')) : null;
-    const backupDir = backupName(livePath, stamp);
-    const backupPath = backupRoot ? `${backupRoot}\\${backupDir}` : `${livePath}_${stamp}`;
-    const tempPath = `${livePath}_temp_${stamp}`;
+    const backupRoot = cfg('backup_root') ? backupDirFor(win(cfg('backup_root')), siteName) : null;
+    const tempPath = `${path.dirname(livePath)}\\${stagingName(livePath, stamp)}`;
+    // 스왑으로 밀려날 옛 라이브. **라이브 옆**이라 rename 이 순간이고, 헬스체크까지 산다 (`[D03]`).
+    const orgPath = `${path.dirname(livePath)}\\${orgName(livePath, stamp)}`;
+    const preserveRoot = backupRoot || path.dirname(livePath);
+    const preserveBackup = `${preserveRoot}\\${preserveName(livePath, stamp)}`;
     const remoteFile = `${win(uploadPath)}\\${path.basename(archivePath)}`;
+
+    // 분류된 preserve. 옛 형식(평면 목록·preserve_config)도 여기서 같은 모양이 된다.
+    const kinds = this.engine.context.preserveKinds
+      || classifyPreserve(this.engine.context.preserve, this.engine.context.preserveConfig);
+    const carryNames = [...kinds.temp, ...kinds.data];     // 이월·델타 대상 (설정은 Step 2.5 가 따로 본다)
+    const backupNames = allNames(kinds);                    // 백업 대상 — 셋 전부
 
     // user 를 안 주면 ssh config 가 정한다. 어느 쪽인지 로그에 남겨야 인증 실패를 추적할 수 있다.
     const target = user ? `${user}@${host}` : host;
@@ -174,13 +192,12 @@ class RemoteDeployMacroStage extends BaseStage {
     //
     //   IIS 정지 **전**이다. 설정 파일은 런타임에 아무도 쓰지 않으므로 지금 떠도 되고,
     //   정지 구간에는 rename 두 번만 남는다.
-    const preserveConfig = stageConfig.preserve_config || this.engine.context.preserveConfig || [];
-    // 운영 중 생성되어 배포 뒤에도 유지해야 하는 항목. 스크립트가 **정지한 뒤에** 옮긴다 —
-    // 서비스가 살아 있으면 파일이 쓰이는 중이라 사본이 깨진다.
-    const preserve = stageConfig.preserve || this.engine.context.preserve || [];
+    const preserveConfig = kinds.config;
     const configBackup = cfg('config_backup') ? win(cfg('config_backup')) : null;
 
-    if (preserveConfig.length > 0) {
+    // copy 모드는 라이브를 그대로 두므로 설정이 사라질 일이 없다. 산출물의 설정이
+    // 라이브를 덮지 않게 하는 것이 전부이고, 그것은 `DP_EXCLUDE` 가 한다 (§3.1).
+    if (mode === 'swap' && preserveConfig.length > 0) {
       console.log(`[RemoteDeploy] Step 2.5: 서버 설정 보전 (${preserveConfig.length}건)`);
       if (configBackup) ssh(`if not exist ${configBackup} mkdir ${configBackup}`);
 
@@ -224,7 +241,32 @@ class RemoteDeployMacroStage extends BaseStage {
       }
     }
 
-    // 3. 정지 → 백업 → 스왑 → 시작. **ssh 한 번이다** (#P002-TASK7).
+    // 2.7 유지파일 백업 + 벌크 이월. **정지 전이다** (#P003-REQ2b).
+    //
+    //   여기가 무거운 쪽이다. 정지한 뒤에 옮기면 그 시간이 통째로 다운타임이 된다 —
+    //   예전 `deploy.bat` 의 `DP_PRESERVE`(정지 후 robocopy /E 전량)가 그랬다.
+    //   서비스가 살아 있는 동안 떠 두고, 그 사이 늘어난 것만 스왑 뒤에 따라잡는다(`DP_DELTA`).
+    //
+    //   백업은 **셋 전부**(temp·data·config)를 담는다. `_preserve_<stamp>` 는 백업이면서
+    //   이월 원본이라, "백업할 가치" 가 아니라 "새 배포본에 있어야 하는가" 가 기준이다.
+    if (backupNames.length > 0) {
+      console.log(`[RemoteDeploy] Step 2.7: 유지파일 백업 (${backupNames.length}건) -> ${preserveBackup}`);
+      ssh(`if not exist ${preserveBackup} mkdir ${preserveBackup}`);
+      for (const name of backupNames) {
+        this.#copyTree(ssh, `${livePath}\\${name}`, `${preserveBackup}\\${name}`);
+      }
+
+      // 스왑만 이월한다. copy 모드는 라이브를 그대로 두므로 옮길 이유가 없고,
+      // 옮기면 **백업 시점 스냅샷이 현재 데이터를 덮는다**(§3.2).
+      if (mode === 'swap' && carryNames.length > 0) {
+        console.log(`[RemoteDeploy] Step 2.8: 벌크 이월 (${carryNames.length}건) -> 임시폴더`);
+        for (const name of carryNames) {
+          this.#copyTree(ssh, `${preserveBackup}\\${name}`, `${tempPath}\\${name}`);
+        }
+      }
+    }
+
+    // 3. 정지 → 배포 → 시작. **ssh 한 번이다** (#P002-TASK7).
     //
     //    쪼개면 안 되는 이유는 왕복 비용이 아니라 **라이브가 비는 구간** 때문이다.
     //    두 move 사이에는 라이브 폴더가 존재하지 않는다. 그 사이에 ssh 왕복이 끼면
@@ -235,23 +277,26 @@ class RemoteDeployMacroStage extends BaseStage {
     //    예전에는 여기가 ssh 5회(정지·mkdir·move·move·시작)였다.
     assertRemotePath(`${scriptDir}\\deploy.bat`);
 
-    console.log(`[RemoteDeploy] Step 3: 정지 -> 백업 -> 스왑 -> 시작 (deploy.bat)`);
+    console.log(`[RemoteDeploy] Step 3: 정지 -> ${mode === 'swap' ? '스왑 -> 델타' : '복사'} -> 시작 (deploy.bat)`);
+    console.log(`  mode   ${mode}`);
     console.log(`  live   ${livePath}`);
     console.log(`  staged ${tempPath}`);
-    console.log(`  backup ${backupPath}`);
+    if (mode === 'swap') console.log(`  org    ${orgPath}`);
 
+    const scriptLists = preserveScriptArgs(kinds);
     const r = ssh(`${scriptDir}\\deploy.bat`, {
       capture: true,
       allowFailure: true,
       env: {
+        DP_MODE: mode,
         DP_LIVE: livePath,
         DP_STAGED: tempPath,
-        DP_BACKUP: backupPath,
-        DP_BACKUP_ROOT: backupRoot || undefined,   // 없으면 안 싣는다. 스크립트가 없는 대로 판단한다
-        // 운영 중 생성된 항목(업로드 폴더 등)을 새 배포본으로 옮긴다.
-        // **원격에는 없던 기능이다** — 로컬 매크로에만 있었는데, 같은 스크립트를 쓰게 되면서
-        // 따라왔다. 쪼개진 구현을 합치면 이런 것이 저절로 메워진다.
-        DP_PRESERVE: joinPreserve(preserve) || undefined,
+        // 스왑으로 밀려난 옛 라이브가 갈 자리. 헬스체크가 끝날 때까지 산다.
+        DP_ORG: mode === 'swap' ? orgPath : undefined,
+        // 벌크는 이미 정지 전에 갔다. 스크립트는 **그 사이 늘어난 것만** 따라잡는다.
+        DP_DELTA: mode === 'swap' ? scriptLists.DP_DELTA : undefined,
+        // copy 모드에서 산출물의 설정이 서버 설정을 덮지 않게 한다 (스왑의 Step 2.5 자리).
+        DP_EXCLUDE: mode === 'copy' ? scriptLists.DP_EXCLUDE : undefined,
         // 웹서버 변수는 `deploy.bat` 이 해석하지 않고 어댑터로 **그대로 상속**시킨다.
         WS_SKIP: manageIis ? undefined : '1',
         WS_TYPE: manageIis ? wsType : undefined,
@@ -273,15 +318,24 @@ class RemoteDeployMacroStage extends BaseStage {
     //   2·3·4  아무것도 옮기기 전이다          -> 무장하지 않는다
     //   5      라이브가 없다. 백업이 유일한 사본 -> 무장 (되돌리는 것 말고 답이 없다)
     //   그 외  ssh 가 끊겼다. **상태를 모른다** -> 무장. 못 되돌리는 쪽이 더 나쁘다
+    //
+    // 되돌릴 **원본**도 방식마다 다르다 (`[D04]` 트랙 A).
+    //   swap  `_org_` 가 옆에 있다 — 역스왑이 몇 초다
+    //   copy  옛 빌드는 어디에도 없다 — 직전 확정 zip 을 다시 전개해야 한다
     const KNOWN = [0, 1, 2, 3, 4, 5];
     if (r.code === 0 || r.code === 5 || !KNOWN.includes(r.code)) {
       // 경로는 이력으로 넘긴다 — 롤백이 폴더를 훑는 대신 이 값을 읽는다.
-      vars.backup_path = backupPath;
-      this.engine.armRollback(`원격 백업: ${backupPath} (deploy.bat 종료코드 ${r.code})`);
+      vars.deploy_mode_used = mode;
+      if (mode === 'swap') vars.org_path = orgPath;
+      vars.preserve_backup = preserveBackup;
+      this.engine.armRollback(
+        mode === 'swap'
+          ? `옛 라이브: ${orgPath} (deploy.bat 종료코드 ${r.code})`
+          : `직전 확정 빌드로 되돌릴 수 있습니다 (deploy.bat 종료코드 ${r.code})`);
     }
 
     if (r.code !== 0) {
-      const why = reasonFor(DEPLOY, r.code);
+      const why = deployReason(r.code, mode);
       console.error(`\n[RemoteDeploy] 배포 실패 - ${siteName}`);
       console.error(`  사유     : ${why}`);
       console.error(`  종료코드 : ${r.code}`);
@@ -289,10 +343,14 @@ class RemoteDeployMacroStage extends BaseStage {
       // 사람이 원격에 들어가 짐작으로 찾던 자리다 (#P003-TASK2).
       // 진단이 실패해도 배포 결과는 이미 정해졌다. reportLockHolders 는 던지지 않는다.
       if (r.code === 1) reportLockHolders(ssh, livePath);
-      if (r.code === 5) {
+      if (r.code === 5 && mode === 'swap') {
         // 스크립트가 원복까지 실패한 자리. 사람이 칠 명령을 그대로 적어 준다.
         console.error(`  ⚠️ 라이브 폴더가 없습니다. 원격에서 직접 실행하십시오:`);
-        console.error(`     move ${backupPath} ${livePath}`);
+        console.error(`     move ${orgPath} ${livePath}`);
+      }
+      if (r.code === 5 && mode === 'copy') {
+        // 옛 빌드의 사본이 라이브에 없다. 되돌리는 길은 확정 zip 뿐이다 (`[D04]` 트랙 A).
+        console.error(`  ⚠️ 라이브가 섞였습니다. 직전 확정 빌드로 되돌려야 합니다.`);
       }
       throw new Error(`원격 배포 실패: ${why} (종료코드 ${r.code})`);
     }
@@ -300,84 +358,35 @@ class RemoteDeployMacroStage extends BaseStage {
     // 웹서버를 내렸다 올렸다. health_check 가 이 값을 보고 돈다 (manage_iis:false 면 안 건드렸다).
     vars.server_restarted = manageIis;
 
-    // 7. 원격 백업 정리. 로컬과 같은 정책(`backup.keep_count`)을 쓴다.
-    //    원격은 아무도 훑지 않아 배포마다 690MB 가 무한히 쌓이던 자리다.
-    //    정리 실패는 배포 성공을 뒤집지 않는다 — 로그만 남기고 넘어간다.
-    try {
-      this.#cleanupRemote(ssh, { backupRoot, livePath, remoteFile });
-    } catch (err) {
-      console.error(`[RemoteDeploy] 원격 정리 실패(배포는 정상): ${err.message}`);
-    }
+    // 확정 단계가 읽을 값들. **여기서 지우거나 이름을 바꾸지 않는다** —
+    // 헬스체크가 끝나기 전에 치우면 그것들이 곧 복구 수단이다 (#P003-REQ9).
+    vars.staged_path = tempPath;
+    vars.release_source = remoteFile;
+    vars.release_stamp = stamp;
+    // 확정·롤백이 **다시 구하지 않게** 넘긴다. 각자 구하면 사이트 이름 해석이 갈려
+    // 백업을 뜬 자리와 정리하는 자리가 달라진다 (deploy_mode 가 그랬다).
+    vars.backup_dir = preserveRoot;
 
-    // 8. 롤백이 라이브 옆에 남긴 `_failed_`·`_replaced_` 정리.
-    //    배포가 성공했으면 그 실패는 지나갔다 — 앞으로 갈 사본은 배포 zip 이다.
-    try {
-      this.#cleanupLeftovers(ssh, livePath);
-    } catch (err) {
-      console.error(`[RemoteDeploy] 롤백 잔여 폴더 정리 실패(배포는 정상): ${err.message}`);
-    }
-
-    console.log(`[RemoteDeploy] Completed. 백업: ${backupPath}`);
+    console.log(`[RemoteDeploy] Completed. 확정은 헬스체크 뒤에 합니다 (confirm).`);
   }
 
   /**
-   * 원격의 오래된 백업을 지운다. 목록만 ssh 로 받아 오고 **판단은 로컬에서** 한다 —
-   * 보관 정책(selectBackups)이 부수효과 없는 순수 함수라 그대로 재사용된다.
+   * 원격에서 파일·폴더를 통째로 복사한다. 어느 쪽인지 모르고 부를 수 있어야 해서
+   * 폴더면 robocopy, 파일이면 copy 로 갈라 준다 — 없으면 아무것도 하지 않는다.
+   *
+   * ⚠️ robocopy 는 **정상 복사에도 1 을 낸다.** 그대로 실패로 보면 성공한 이월이 전부 실패가 된다.
+   *    `allowFailure` 로 받아 8 이상만 실패로 다룬다.
    */
-  #cleanupRemote(ssh, { backupRoot, livePath }) {
-    const root = backupRoot || livePath.replace(/\\[^\\]+$/, '');
-    const listed = ssh(`dir /b /ad ${root}`, { capture: true, allowFailure: true });
-    if (listed.code !== 0) {
-      console.log(`[RemoteDeploy] 원격 백업 목록을 읽지 못했습니다: ${root}`);
-      return;
+  #copyTree(ssh, from, to) {
+    const r = ssh(
+      `if exist ${from}\\ (robocopy ${from} ${to} /E /NFL /NDL /NJH /NJS /R:1 /W:1 > nul) ` +
+      `else (if exist ${from} copy /y ${from} ${to} > nul)`,
+      { capture: true, allowFailure: true }
+    );
+    if (r.code >= 8) {
+      throw new Error(`원격 복사 실패(${r.code}): ${from} -> ${to}`);
     }
-
-    const names = (listed.output || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-    const policy = this.engine.context.backup || {};
-    const { keep, remove } = selectFromNames(names, livePath, root, policy);
-
-    console.log(`[RemoteDeploy] 원격 백업 ${keep.length + remove.length}건: 유지 ${keep.length}, 삭제 ${remove.length}`);
-    for (const item of keep) console.log(`  [keep]   ${item.name}`);
-
-    if (policy.dry_run) {
-      for (const item of remove) console.log(`  [dry-run] would remove ${item.name}`);
-      return;
-    }
-
-    for (const item of remove) {
-      ssh(`rmdir /s /q ${root}\\${item.name}`, { capture: true, allowFailure: true });
-      console.log(`  [remove] ${item.name}`);
-    }
-  }
-
-  /**
-   * 라이브 옆의 롤백 잔여 폴더를 지운다. 백업 정리와 같은 방식이다 — 목록만 받아 오고
-   * 고르는 규칙(`selectLeftovers`)은 로컬과 같은 함수를 쓴다.
-   */
-  #cleanupLeftovers(ssh, livePath) {
-    const policy = this.engine.context.backup || {};
-    if (policy.enabled === false) return;
-
-    const parent = livePath.replace(/\\[^\\]+$/, '');
-    const listed = ssh(`dir /b /ad ${parent}`, { capture: true, allowFailure: true });
-    if (listed.code !== 0) {
-      console.log(`[RemoteDeploy] 라이브 상위 폴더 목록을 읽지 못했습니다: ${parent}`);
-      return;
-    }
-
-    const names = (listed.output || '').split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-    const targets = selectLeftovers(names, livePath);
-    if (targets.length === 0) return;
-
-    console.log(`[RemoteDeploy] 롤백 잔여 폴더 ${targets.length}건 삭제`);
-    for (const name of targets) {
-      if (policy.dry_run) {
-        console.log(`  [dry-run] would remove ${name}`);
-        continue;
-      }
-      ssh(`rmdir /s /q ${parent}\\${name}`, { capture: true, allowFailure: true });
-      console.log(`  [remove] ${name}`);
-    }
+    return r;
   }
 
   /**

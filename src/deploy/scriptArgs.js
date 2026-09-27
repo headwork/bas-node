@@ -43,4 +43,28 @@ function joinPreserve(names) {
   return list.join(';');
 }
 
-module.exports = { joinPreserve };
+/**
+ * 분류를 스크립트가 받을 목록으로 옮긴다. (#P003-TASK5)
+ *
+ * **스크립트는 분류를 모른다.** 분류 이름이 bat 안에 들어가면 정책이 스크립트로 새고,
+ * 그때부터는 정책을 바꿀 때마다 배포서버의 스크립트를 함께 고쳐야 한다 (`[D10]` 경계).
+ * 그래서 Node 가 여기서 **용도별 목록**으로 바꿔 넘긴다.
+ *
+ * | 변수 | 값 | 쓰는 쪽 |
+ * |---|---|---|
+ * | `DP_EXCLUDE` | `config` | copy — 복사에서 뺀다. 산출물의 설정이 서버 설정을 덮지 않게 |
+ * | `DP_DELTA`   | `temp` + `data` | swap — 스왑 뒤 `_org_` 에서 따라잡는다 |
+ *
+ * `temp`·`data` 가 `DP_EXCLUDE` 에 없는 것은 실수가 아니다 — **산출물에 그 이름이 없어서**
+ * 충돌 자체가 일어나지 않는다. robocopy 는 미러가 아니면 원본에 없는 파일을 지우지 않는다.
+ * 없는 위험을 막는 설정을 적어 두면 읽는 사람이 "왜 이게 필요하지" 를 매번 다시 묻게 된다.
+ */
+function preserveScriptArgs(classified) {
+  const kinds = classified || {};
+  return {
+    DP_EXCLUDE: joinPreserve(kinds.config || []) || undefined,
+    DP_DELTA: joinPreserve([...(kinds.temp || []), ...(kinds.data || [])]) || undefined
+  };
+}
+
+module.exports = { joinPreserve, preserveScriptArgs };

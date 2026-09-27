@@ -20,17 +20,28 @@ const CARRY_KEYS = [
   // 라이브를 이미 백업으로 치웠는가. 그룹을 나눠 부르면 프로세스가 새로 뜨는데,
   // 이월하지 않으면 앞 그룹에서 스왑까지 끝낸 배포가 뒤 그룹의 실패로 롤백되지 않는다.
   'rollback_armed',
-  // 이 배포가 만든 백업 폴더. **롤백이 읽는 값이다.**
-  // 폴더를 훑어 최신을 집는 방식은 그것이 성공한 배포였는지 알 수 없다.
   // 되돌릴 대상을 고르려면 라이브 경로·원격 여부도 함께 있어야 한다.
-  'backup_path', 'web_deploy_path', 'deploy_remote', 'host', 'port',
+  // (되돌릴 **원본**은 아래 `release_zip` 이다. 폴더 백업은 더 만들지 않는다.)
+  'web_deploy_path', 'deploy_remote', 'host', 'port',
   // 웹서버 제어에 필요한 값들. `iis_site` 는 구명이고 지금 이름은 `web_server_name` 이다 —
   // **둘 다 이월한다.** 기존 yaml 이 수정 없이 돌아야 하고(#P002-REQ5), 새 yaml 도
   // 그룹을 나눠 부를 때 이름을 잃으면 안 된다.
   'iis_site', 'web_server_name', 'web_server_type', 'web_server_pool', 'script_dir',
   // 이번 배포가 웹서버를 (다시) 띄웠는가. health_check 의 `if:` 가 읽는다 —
   // 재시작이 없었으면 확인할 것도 없다(정적 배포).
-  'server_restarted'
+  'server_restarted',
+  // 확정 단계와 롤백이 읽는 값들 (#P202609_003).
+  //   release_zip    확정된 빌드 zip. **롤백의 유일한 원본이다**
+  //   release_source 확정 전의 올린 zip · release_stamp 이 배포의 스탬프(네 이름을 묶는 축)
+  //   org_path       스왑으로 밀려난 옛 라이브 (헬스체크 실패 시 역스왑 대상)
+  //   staged_path    copy 모드의 임시폴더 (확정 때 지운다)
+  //   deploy_mode_used  어느 방식으로 배포됐나 — 되돌리는 방법이 갈린다
+  'release_zip', 'release_source', 'release_stamp',
+  'org_path', 'staged_path', 'preserve_backup', 'deploy_mode_used',
+  // 확정 zip 이 모이는 자리를 롤백이 찾으려면 필요하다.
+  //   backup_dir  이번 배포가 **실제로 쓴** 백업 폴더(`backup_root\<웹서버이름>`).
+  //               확정이 다시 구하면 해석이 갈려 백업을 뜬 자리와 정리하는 자리가 달라진다.
+  'backup_root', 'backup_dir'
 ];
 
 const MAX_CHANGED_FILES = 500;
@@ -207,20 +218,21 @@ class DeployState {
   }
 
   /**
-   * 롤백 후보를 최신순으로 돌려준다 — **백업 경로가 남아 있는 성공 배포**만.
+   * 확정 빌드가 있는 성공 배포만 — 최신순. (#P202609_003)
    *
-   * `--rollback=N` 의 N 은 이 목록의 순번이다(1 = 직전 성공 배포).
-   * 소비된 백업(`backup_consumed`)은 빠진다 — 파이프라인 실패로 롤백이 그 폴더를
-   * 라이브로 되돌리면서 써버린 것이라, 없는 게 정상이다.
-   * 반면 이력에 살아 있는데 폴더가 없으면 **사람이 지운 것**이므로 후보로 두고
-   * 고르는 쪽에서 에러를 낸다 — 조용히 다음 것으로 넘어가면 의도보다 더 되돌아간다.
+   * **되돌릴 곳은 이것뿐이다.** `--rollback=N` 의 N 은 이 목록의 순번이고
+   * (1 = 직전 확정 배포), `--dry-run` 이 보여 주는 목록도 같은 것이어야 한다 —
+   * 세는 곳과 고르는 곳이 다르면 N 이 가리키는 판이 달라진다.
+   *
+   * 폴더 백업 시절 이력(zip 없음)은 걸리지 않는다. 없는 것을 있다고 하면
+   * 되돌릴 수 없는 상태에서 라이브를 덮는다. 후보가 0 건인 것은 고장이 아니라
+   * **아직 확정된 배포가 없다**는 사실이고, 고르는 쪽이 그렇게 말한다.
    */
-  rollbackCandidates(environment) {
+  releaseCandidates(environment) {
     return this.load().runs.filter(r =>
       r.status === 'success' &&
       r.environment === environment &&
-      r.variables && r.variables.backup_path &&
-      !r.backup_consumed
+      r.variables && r.variables.release_zip
     );
   }
 

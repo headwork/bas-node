@@ -24,9 +24,13 @@ const FsRenameStage = require('./stages/FsRenameStage');
 const SyncStaticStage = require('./stages/SyncStaticStage');
 const HealthCheckStage = require('./stages/HealthCheckStage');
 const BackupCleanupStage = require('./stages/BackupCleanupStage');
+const ConfirmStage = require('./stages/ConfirmStage');
+const { resolveDeployMode, findDeployStageConfig } = require('./deployMode');
+const { backupDirFor, siteNameFrom } = require('./backupRetention');
 const ArchiveStage = require('./stages/ArchiveStage');
 const { collectSecretKeys, maskVariables, maskUrlCredentials } = require('./maskSecrets');
 const { decodeOutput } = require('./decodeOutput');
+const { classifyPreserve, KINDS: PRESERVE_KINDS } = require('./preserveClassify');
 
 // Macro Stages
 const GitSyncStage = require('./stages/GitSyncStage');
@@ -69,6 +73,8 @@ class PipelineEngine {
       'fs_rename': new FsRenameStage(this),
       'sync_static': new SyncStaticStage(this),
       'health_check': new HealthCheckStage(this),
+      // 확정 — 이름 변경·삭제는 전부 여기서, 헬스체크 **뒤에** 한다 (#P003-REQ9)
+      'confirm': new ConfirmStage(this),
       'backup_cleanup': new BackupCleanupStage(this),
       'archive': new ArchiveStage(this),
       // Macros
@@ -360,23 +366,26 @@ class PipelineEngine {
       console.log(`[Rollback] 배포 이력을 읽을 수 없습니다 (설정 폴더 없음).`);
       return;
     }
-    const candidates = state.rollbackCandidates(this.context.environment);
-    console.log(`\n[Rollback] 되돌릴 수 있는 배포 (${candidates.length}건)`);
+    // **실행과 같은 목록을 쓴다.** 세는 곳과 고르는 곳이 다르면 여기 3번으로 보인 판과
+    // `--rollback=3` 이 되돌리는 판이 달라진다 — 그리고 그것은 에러를 내지 않는다.
+    const candidates = state.releaseCandidates(this.context.environment);
+    console.log(`\n[Rollback] 되돌릴 수 있는 확정 빌드 (${candidates.length}건)`);
     candidates.forEach((run, i) => {
-      const backup = run.variables.backup_path;
-      // 원격 배포의 백업은 저쪽 디스크에 있다. 여기서 fs 로 보면 언제나 "없음" 이라
-      // 멀쩡한 백업을 지워진 것으로 보고하게 된다. 원격은 판정하지 않는다 —
-      // 실제 존재 확인은 롤백이 ssh `if exist` 로 하고, 없으면 그때 멈춘다.
+      const zip = run.variables.release_zip;
+      // 원격 배포의 확정 빌드는 저쪽 디스크에 있다. 여기서 fs 로 보면 언제나 "없음" 이라
+      // 멀쩡한 빌드를 지워진 것으로 보고하게 된다. 원격은 판정하지 않는다 —
+      // 실제 존재 확인은 롤백이 스크립트 안에서 하고, 없으면 그때 `4` 로 멈춘다.
       const remote = run.variables.deploy_remote === true;
       const note = remote
         ? '   (원격 - 실행 시 확인)'
-        : (fs.existsSync(backup) ? '' : '   <-- 폴더 없음(사람이 지움)');
-      console.log(`  ${i + 1}. ${path.basename(backup)}${note}`);
+        : (fs.existsSync(zip) ? '' : '   <-- 파일 없음(사람이 지움)');
+      console.log(`  ${i + 1}. ${path.basename(zip)}${note}`);
       console.log(`     키 ${run.key} / 커밋 ${(run.variables.git_to || '').slice(0, 8) || '-'}` +
         ` / ${run.finished_at || run.started_at}`);
     });
     if (candidates.length === 0) {
-      console.log(`  (없음) 백업이 남아 있는 성공 배포가 있어야 합니다.`);
+      console.log(`  (없음) 헬스체크를 통과해 **확정된** 배포가 있어야 합니다.`);
+      console.log(`         아직 한 번도 없다면 비어 있는 것이 맞습니다 - 첫 배포에는 되돌릴 곳이 없습니다.`);
     }
   }
 
@@ -478,9 +487,23 @@ class PipelineEngine {
     // 백업 보관 정책도 변수 치환을 거친다 (YAML 에서 ${...} 로 쓸 수 있게)
     this.context.backup = this.interpolateObject(doc.backup || {});
     // 운영 중 생성되어 배포 뒤에도 유지해야 하는 항목 (EDMS · Temp 등)
+    //
+    // 분류(`temp`·`data`·`config`)로 정규화해서 들고 다닌다 (#P003-REQ2). 옛 형식
+    // (평면 배열 · 별도 `preserve_config`)은 승격해서 받으므로 기존 YAML 이 그대로 돈다.
+    // ⚠️ `context.preserve` · `context.preserveConfig` 는 **그대로 둔다** — 스테이지들이
+    //    이 이름으로 읽고 있고, 한 번에 다 바꾸면 무엇이 깨졌는지 가릴 수 없다.
+    this.context.preserveKinds = classifyPreserve(
+      this.interpolateObject(doc.preserve || []),
+      this.interpolateObject(doc.preserve_config || [])
+    );
     this.context.preserve = this.interpolateObject(doc.preserve || []);
     // 서버 설정 파일. 위 preserve 와 시점이 다르다 — IIS 정지 전에, 라이브에서 가져온다.
     this.context.preserveConfig = this.interpolateObject(doc.preserve_config || []);
+    // 새 형식으로 적었으면 분류에서 읽어 온다. 옛 형식이면 위의 승격 결과와 같은 값이다.
+    if (this.context.preserveKinds.promoted.length === 0) {
+      this.context.preserve = [...this.context.preserveKinds.temp, ...this.context.preserveKinds.data];
+      this.context.preserveConfig = this.context.preserveKinds.config;
+    }
     // 빌드 산출물에서 지울 것. 소스의 설정 파일이 서버까지 가지 않게 한다.
     this.context.exclude = this.interpolateObject(doc.exclude || []);
 
@@ -497,6 +520,14 @@ class PipelineEngine {
 
     // 그룹 선택 (--only). 젠킨스가 단계별로 나눠 부를 때 쓴다.
     const plan = this.selectStages(allStages, options.only);
+
+    // 이번 실행이 **어떻게 돌았는지** 한 블록에 남긴다. 나중에 로그만 보고 판정할 수 있어야 한다.
+    this.#printRunSettings(allStages, options);
+
+    // 배포는 하는데 확정이 없는 YAML. **배포는 성공하고 되돌릴 곳만 안 생긴다** —
+    // 에러가 나지 않으므로 말해 주지 않으면 롤백이 필요한 날까지 아무도 모른다.
+    // `allStages` 로 본다: `--only` 로 쪼개 부르면 confirm 이 다른 그룹에 있는 것이 정상이다.
+    this.#warnIfUnconfirmed(allStages);
 
     if (options.only) {
       console.log(`[Pipeline] 그룹 '${options.only}' 만 실행합니다 (${plan.selected.length}/${allStages.length}단계)`);
@@ -600,6 +631,79 @@ class PipelineEngine {
    *   - only 가 없으면 전부 실행한다 (기존 동작 그대로)
    *   - only 가 있으면 그 group 만 골라 YAML 순서대로 실행한다
    */
+  /**
+   * **이번 실행은 이렇게 돌았다** — 행동을 가르는 설정만 한 블록에 찍는다 (#P202609_003).
+   *
+   * 2026-09-23 보스 지시. `Merged Context Variables` 는 **전부** 찍지만 그래서 아무것도
+   * 두드러지지 않고, 스테이지 설정 안에 있는 값(`deploy_mode`)은 아예 빠진다.
+   * QA 가 swap 으로 돌고 있는데 그 목록에 없다는 이유로 copy 라고 읽은 일이 있었다.
+   * 그래서 **해석이 끝난 값**을, 방식은 **출처와 함께** 적는다.
+   *
+   * 비밀은 담지 않는다 — 여기 적는 항목은 고정 목록이므로 새 비밀이 섞일 경로가 없다.
+   */
+  #printRunSettings(stages, options) {
+    const v = this.context.variables || {};
+    const remote = v.deploy_remote === true;
+    const backup = this.context.backup || {};
+
+    let mode;
+    try {
+      const r = resolveDeployMode({
+        override: v.deploy_mode_override,
+        stageConfig: findDeployStageConfig(stages, remote),
+        vars: v
+      });
+      mode = `${r.mode}  (${r.source})`;
+    } catch (err) {
+      // 잘못된 값이면 배포 스테이지가 어차피 멈춘다. 요약이 먼저 죽을 이유는 없다.
+      mode = `?  (${err.message})`;
+    }
+
+    const rows = [
+      ['환경', this.context.environment],
+      ['배포방식', mode],
+      ['대상', remote ? `원격 ${v.host}${v.port ? `:${v.port}` : ''}` : '로컬'],
+      ['라이브', v.web_deploy_path],
+      ['백업', v.backup_root
+        ? `${v.backup_dir || backupDirFor(v.backup_root, siteNameFrom(v, v.web_deploy_path))}` +
+          `  (보관 ${backup.keep_count ?? '-'}판)`
+        : '(라이브 옆)'],
+      ['브랜치', v.branch],
+      ['압축', v.compress],
+      ['공지', `telegram=${v.telegram === true} confluence=${v.confluence === true}`],
+      ['그룹', options.only || '(전체)'],
+      ['DRY RUN', options.dryRun ? '예 - 실행하지 않습니다' : '아니오']
+    ];
+
+    // 한글은 한 글자가 두 칸이다. `padEnd` 는 글자 수로 세므로 그대로 쓰면 줄이 어긋나는데,
+    // 이 블록은 훑어보라고 만든 것이라 정렬이 곧 쓸모다.
+    const width = (s) => [...s].reduce((n, ch) => n + (/[ᄀ-ᇿ　-〿가-힯＀-｠]/.test(ch) ? 2 : 1), 0);
+    const pad = (s, cols) => s + ' '.repeat(Math.max(1, cols - width(s)));
+
+    console.log(`\n[이번 배포]`);
+    for (const [label, value] of rows) {
+      if (value === undefined || value === null || value === '') continue;
+      console.log(`  ${pad(String(label), 10)}${value}`);
+    }
+  }
+
+  /**
+   * 배포 스테이지는 있는데 `confirm` 이 없으면 경고한다 (#P202609_003).
+   *
+   * 확정이 없으면 롤백의 원본(확정 zip)이 만들어지지 않고, 스왑이 밀어낸 `_org_` 도
+   * 치워지지 않아 계속 쌓인다. 그런데 **배포 자체는 성공한다** — 멈추지 않고 말만 한다.
+   * 멈추면 옛 YAML 로 돌던 배포가 한순간에 전부 실패하는데, 그것은 더 나쁘다.
+   */
+  #warnIfUnconfirmed(stages) {
+    const names = stages.map(s => Object.keys(s)[0]);
+    const deploys = names.filter(n => n === 'local_deploy' || n === 'remote_deploy');
+    if (deploys.length === 0 || names.includes('confirm')) return;
+
+    console.log(`[Pipeline] ⚠️ '${deploys.join(', ')}' 는 있는데 'confirm' 스테이지가 없습니다.`);
+    console.log(`[Pipeline]    이 배포는 확정되지 않아 **되돌릴 수 없습니다** (확정 zip 이 생기지 않습니다).`);
+    console.log(`[Pipeline]    health_check 뒤에 추가하십시오:  - confirm: { group: deploy }`);
+  }
+
   selectStages(stages, only) {
     const groupOf = s => {
       const name = Object.keys(s)[0];
@@ -650,10 +754,17 @@ class PipelineEngine {
       console.log(`  ${key.padEnd(width)} = ${value}`);
     }
 
-    if (this.context.preserve.length > 0) {
-      console.log(`\n[운영 중 생성 항목 보존] IIS 정지 후 이전 배포본에서 가져온다`);
-      for (const name of this.context.preserve) {
-        console.log(`  ${name}`);
+    // 분류별로 찍는다. 어느 분류로 읽혔는지 보이지 않으면, 옛 형식이 의도와 다르게
+    // 승격돼도 알 수 없다 (#P002 `[D06]` 이 승격을 dry-run 에 찍는 것과 같은 이유).
+    const kinds = this.context.preserveKinds || {};
+    if (PRESERVE_KINDS.some(k => (kinds[k] || []).length > 0)) {
+      console.log(`\n[운영 중 생성 항목 보존]`);
+      for (const kind of PRESERVE_KINDS) {
+        const names = kinds[kind] || [];
+        if (names.length > 0) console.log(`  ${kind.padEnd(6)} ${names.join(', ')}`);
+      }
+      for (const line of kinds.promoted || []) {
+        console.log(`  [승격] ${line}`);
       }
     }
 

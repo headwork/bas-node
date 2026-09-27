@@ -240,21 +240,29 @@ rem ---------------------------------------------------------------------------
 
     set "WP_LEFT=%WS_WP_WAIT%"
     if not defined WP_LEFT set "WP_LEFT=15"
+    set "WP_WAITED=0"
 
 :wait_wp_loop
     set "WP_FOUND="
     rem Same outer-quote trick as :target_of - without it `for /f` sees nothing
     rem and every pool looks idle.
     for /f "delims=" %%A in ('""%APPCMD%" list wp /apppool.name:"%WS_POOL%" 2>nul"') do set "WP_FOUND=1"
-    if not defined WP_FOUND exit /b 0
+    if not defined WP_FOUND (
+        rem Silent when there was nothing to wait for - that is the normal case and
+        rem a line per deploy would be noise. Say it only when the wait did something,
+        rem so the log carries the evidence that this guard is earning its place.
+        if not "%WP_WAITED%"=="0" echo [webserver] OK worker process of %WS_POOL% gone after %WP_WAITED%s
+        exit /b 0
+    )
 
     if %WP_LEFT% LEQ 0 (
-        echo [webserver] WARNING worker process of %WS_POOL% still running - continuing anyway
+        echo [webserver] WARNING worker process of %WS_POOL% still running after %WP_WAITED%s - continuing anyway
         exit /b 0
     )
 
     ping -n 2 127.0.0.1 > nul
     set /a WP_LEFT-=1
+    set /a WP_WAITED+=1
     goto :wait_wp_loop
 
 

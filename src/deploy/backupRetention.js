@@ -49,7 +49,86 @@ function backupPatternFor(deployPath) {
  */
 function leftoverPatternFor(deployPath) {
   const base = path.basename(deployPath);
-  return new RegExp('^' + escapeRegExp(base) + '_(?:failed|replaced)_\\d{8}_\\d{6}(?:_\\d+)?$');
+  // `org` 가 여기 있는 이유: 스왑으로 밀려난 옛 라이브는 **헬스체크까지만** 사는데,
+  // 확정 단계가 못 돌면(프로세스가 죽거나 젠킨스가 잡을 끊으면) 그대로 남는다.
+  // 다음 배포가 성공했다는 것은 그 판이 더는 필요 없다는 뜻이다 (#P003-TASK9).
+  return new RegExp('^' + escapeRegExp(base) + '_(?:failed|replaced|org)_\\d{8}_\\d{6}(?:_\\d+)?$');
+}
+
+/**
+ * 한 배포가 만드는 이름들. **스탬프 하나로 묶인다** (#P003 `[D03]`).
+ *
+ * 이름 규칙이 흩어지면 짝이 깨진다 — 유지파일 백업은 지웠는데 확정 zip 은 남는 식이다.
+ * 그때 둘을 잇는 것이 스탬프인데, 만드는 자리가 여러 곳이면 같은 배포가 서로 다른 스탬프를 갖는다.
+ * 그래서 이름을 만드는 일은 전부 이 파일에 둔다.
+ *
+ *   <live>_temp_<stamp>       스테이징 (압축해제 결과)
+ *   <live>_org_<stamp>        스왑으로 밀려난 옛 라이브. 헬스체크까지 산다
+ *   <live>_preserve_<stamp>   유지파일 백업 겸 이월 원본 (backup_root)
+ *   <live>_<stamp>.zip        확정 빌드 = 롤백 원본 (backup_root\_builds)
+ */
+function stagingName(deployPath, stamp) {
+  return `${path.basename(deployPath)}_temp_${stamp}`;
+}
+
+function orgName(deployPath, stamp) {
+  return `${path.basename(deployPath)}_org_${stamp}`;
+}
+
+function preserveName(deployPath, stamp) {
+  return `${path.basename(deployPath)}_preserve_${stamp}`;
+}
+
+function releaseName(deployPath, stamp) {
+  return `${path.basename(deployPath)}_${stamp}.zip`;
+}
+
+/** 확정 zip 이 모이는 폴더. 폴더 백업(`<live>_<stamp>`)과 이름이 겹치므로 자리를 가른다. */
+function releaseDir(backupRoot) {
+  return `${String(backupRoot).replace(/[\\/]+$/, '')}\\_builds`;
+}
+
+/**
+ * **이 배포의 백업이 모이는 폴더** — `backup_root` 밑에 웹서버 이름으로 한 겹 판다.
+ * (2026-09-23 보스 지시: `백업루트 + ${web_server_name}`)
+ *
+ * 이름 규칙만으로도 도구끼리 섞이지는 않는다. 정리 패턴이 `<라이브>_<14자리>` 로 좁혀져 있어서다.
+ * **문제는 사람이다.** 한 폴더에 QA 백업·운영 일일 백업·config·settings 가 함께 있으면
+ * 뭘 지워도 되는지 판단이 안 서고, 그 판단을 급할 때 해야 한다.
+ * 한 겹 파면 폴더를 여는 순간 답이 보인다.
+ *
+ * 라이브 폴더명이 아니라 **웹서버 이름**인 이유: 사람이 알아보는 단위가 사이트이고,
+ * 배포 경로를 옮겨도 같은 자리에 쌓인다.
+ */
+function backupDirFor(backupRoot, siteName) {
+  const root = String(backupRoot).replace(/[\\/]+$/, '');
+  const name = String(siteName || '').trim();
+  if (!name) return root;          // 이름을 못 구하면 옛 자리에 둔다. 엉뚱한 곳에 쌓는 것보다 낫다.
+  return `${root}\\${name}`;
+}
+
+/**
+ * 웹서버 이름을 구하는 **되돌아가기용** 규칙.
+ *
+ * 배포 스테이지는 저마다 이미 사이트 이름을 구해 두고 그 값을 `backup_dir` 로 넘긴다.
+ * 이 함수는 그 값이 없을 때(확정만 따로 돌거나, 배포 전 요약 로그) 쓴다.
+ * 배포·확정·요약이 **각자 구하면 갈리므로**, 갈릴 수 있는 자리를 여기 하나로 모아 둔다.
+ */
+function siteNameFrom(vars = {}, deployPath = '') {
+  return vars.web_server_name || vars.iis_site || vars.remote_iis_site
+    || (deployPath ? path.basename(String(deployPath).replace(/[\\/]+$/, '')) : '');
+}
+
+/** 유지파일 백업 이름 규칙. 폴더 백업 패턴(`<live>_<stamp>`)에 안 걸리므로 따로 둔다. */
+function preservePatternFor(deployPath) {
+  const base = path.basename(deployPath);
+  return new RegExp('^' + escapeRegExp(base) + '_preserve_(\\d{8}_\\d{6})(?:_(\\d+))?$');
+}
+
+/** 확정 zip 이름 규칙. 폴더가 아니라 **파일**이라 확장자까지 본다. */
+function releasePatternFor(deployPath) {
+  const base = path.basename(deployPath);
+  return new RegExp('^' + escapeRegExp(base) + '_(\\d{8}_\\d{6})(?:_(\\d+))?\\.zip$', 'i');
 }
 
 /** 이름 목록에서 롤백 잔여 폴더만 고른다. 원격도 이 함수를 쓴다(목록만 ssh 로 받는다). */
@@ -173,6 +252,43 @@ function selectFromNames(names, deployPath, backupRoot, config) {
 }
 
 /**
+ * 같은 보관 정책을 **다른 이름 규칙**에 적용한다 (#P003-TASK9).
+ *
+ * 유지파일 백업(`_preserve_`)과 확정 zip(`.zip`)은 폴더 백업과 규칙만 다르고
+ * 정책은 같다 — `keep_count` 가 하나인 이유다. 정책을 종류마다 따로 두면
+ * "셋 중 하나만 지워져 짝이 깨진 상태" 를 만들 수 있다.
+ */
+function selectByPattern(names, pattern, toPath, config) {
+  return selectBackups(matchByPattern(names, pattern, toPath), new Date(), config);
+}
+
+/**
+ * 고르기 전 단계 — 규칙에 맞는 것만 최신순으로 추린다.
+ *
+ * 선택과 나눠 둔 이유는 **여러 폴더를 한 판으로 세기 위해서다.** 백업 자리를 옮기면
+ * 옛 자리와 새 자리에 같은 종류가 나뉘어 있는데, 각각 `keep_count` 를 적용하면
+ * 옛 자리의 3건이 영영 안 줄어든다. 합쳐서 세면 새 배포가 쌓이는 만큼 옛것이 밀려난다.
+ */
+function matchByPattern(names, pattern, toPath) {
+  const items = [];
+  for (const name of names) {
+    const matched = pattern.exec(name);
+    if (!matched) continue;
+    const timestamp = parseStamp(matched[1]);
+    if (timestamp === null) continue;
+    items.push({ name, path: toPath(name), timestamp, seq: Number(matched[2] || 1) });
+  }
+  return items.sort((a, b) => (b.timestamp - a.timestamp) || (b.seq - a.seq));
+}
+
+/** 확정 zip 목록 — 최신순. `--rollback=N` 의 N 번째가 이 목록의 N 번째다. */
+function listReleases(names, deployPath, dir) {
+  const { keep, remove } = selectByPattern(
+    names, releasePatternFor(deployPath), name => `${dir}\\${name}`, { keep_count: Number.MAX_SAFE_INTEGER });
+  return [...keep, ...remove];
+}
+
+/**
  * 보관/삭제 대상을 가른다. 부수효과 없는 순수 함수 — 정책만 담는다.
  * 원격 정리도 이 함수를 쓴다(목록만 ssh 로 받아 온다).
  *
@@ -249,14 +365,27 @@ module.exports = {
   DEFAULTS,
   backupPatternFor,
   leftoverPatternFor,
+  preservePatternFor,
+  releasePatternFor,
   selectLeftovers,
   removeLeftovers,
   backupName,
+  stagingName,
+  orgName,
+  preserveName,
+  releaseName,
+  releaseDir,
+  backupDirFor,
+  siteNameFrom,
   stampNow,
   uniquePath,
   parseStamp,
   listBackups,
+  listReleases,
   selectFromNames,
+  selectByPattern,
+  matchByPattern,
+  matchBackups,
   selectBackups,
   applyRetention
 };

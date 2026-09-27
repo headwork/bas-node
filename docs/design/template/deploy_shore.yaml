@@ -51,6 +51,12 @@ server_list:
     web_server_type: "iis"
     web_server_name: "${project_name2}_QA"
     health_url: "https://wesysqa.hls.co.kr/healthz"
+    # 배포 방식 (#P202609_003). 생략하면 copy 다.
+    #   copy  기존 폴더에 덮어쓴다. 폴더를 rename 하지 않아 **누가 열고 있어도 배포된다**
+    #   swap  폴더를 갈아끼운다. 원자적이고 빠르지만, 잠겨 있으면 그 자리에서 막힌다
+    # QA 는 실패해도 영향이 없어 새 방식의 검증장이다. **명시한다** — 적지 않으면
+    # 기본값(copy)으로 조용히 바뀌고, 에러가 나지 않아 사람이 눈치채지 못한다.
+    deploy_mode: "swap"
 
   prod_server: &prod_server
     <<: *qa_server
@@ -58,6 +64,9 @@ server_list:
     web_deploy_path: "D:/Deploy/${project_name}"
     web_server_name: "${project_name2}"
     health_url: "https://wesys.hls.co.kr/healthz"
+    # 운영은 기존 방식(복사)을 유지한다. 누적된 옛 파일을 쓸어낼 때만
+    # `--mode=swap` 으로 한 번 돌린다 — yaml 을 고치면 고친 채로 남는다.
+    deploy_mode: "copy"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,9 +150,21 @@ config_backup: "${project_root}/server_config/${web_server_name}"
 # ⚠️ 이름에 **공백·쉼표·세미콜론·와일드카드를 쓰지 않는다.** 스크립트가 그 자리에서
 #    목록을 쪼개므로 이름이 갈라지고, 갈라진 이름은 "이전 배포본에 없음" 으로
 #    건너뛰어진다 — **배포는 성공하고 데이터만 사라진다.** 도구가 조립할 때 막는다.
+#
+# 분류로 적는다 (#P202609_003). 분류마다 배포 방식별 처리가 다르다.
+#   temp    다시 만들어진다 (캐시·임시)      copy: 그대로 둔다 / swap: 이월 + 델타
+#   data    유실되면 복구 불가 (업로드)      copy: 그대로 둔다 / swap: 이월 + 델타
+#   config  없으면 서비스가 안 뜬다          copy: 복사 제외  / swap: 이월 + config_backup 갱신
+#
+# `<라이브>_preserve_<시각>` 백업은 **백업이자 이월 원본**이라 셋 전부를 담는다.
+# 기준은 "백업할 가치" 가 아니라 "새 배포본에 있어야 하는가" 다.
+#
+# 옛 형식(평면 목록 · 별도 preserve_config)도 그대로 받는다 — 평면 목록은 data 로,
+# preserve_config 는 config 로 승격하고 그 결과를 --dry-run 에 [승격] 으로 찍는다.
 # preserve:
-#   - "uploads"
-#   - "Temp"
+#   temp:   ["Temp"]
+#   data:   ["uploads"]
+#   config: ["web.config", "appsettings.json"]
 
 # 백업 보관 정책. 배포 성공 직후 자동 적용된다 (로컬·원격 모두).
 # 이 개수가 곧 `--rollback=N` 의 N 상한이다 — 남기지 않은 것은 되돌릴 수 없다.
@@ -208,6 +229,13 @@ stages:
   #   정적 배포, 죽어 있음  시작함     -> 확인
   # health_url 이 없는 배포대상은 건너뛴다.
   - health_check:  { group: deploy, if: server_restarted }
+
+  # 확정. **이름 변경·삭제는 전부 여기서** 한다 — 헬스체크를 통과한 뒤다 (#P202609_003).
+  #   · 올린 zip 을 `<backup_root>/_builds/<라이브>_<시각>.zip` 으로 확정한다. **롤백의 원본이다**
+  #   · 스왑이 밀어낸 `<라이브>_org_<시각>` 을 지운다 (사본을 또 뜨지 않는다 - zip 이 대신한다)
+  #   · 보관 정책을 확정 zip · 유지파일 백업에 적용하고, 옛 폴더 백업이 남아 있으면 쓸어낸다
+  # 그 전까지 라이브 옆에 남아 있는 것들이 곧 복구 수단이므로, 앞당기면 안 된다.
+  - confirm:       { group: deploy }
   - confluence:    { group: deploy }                     # confluence: true 인 경우만 동작
 
 # 배포가 실패하면 실행된다. 백업 폴더로 라이브를 되돌린다.

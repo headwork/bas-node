@@ -39,17 +39,32 @@ const PATCH = {
 };
 
 /**
- * `deploy.bat` — 정지 → 백업 → 스왑 → 시작.
+ * `deploy.bat` — 정지 → (복사 | 스왑) → 시작.
  *
  * ⚠️ `1` 과 `5` 의 차이가 **이 스크립트에서 가장 중요한 갈림길**이다.
- *    `1` 은 라이브가 살아 있다(옮기기 전이거나, 되돌렸다). 사람이 할 일이 없다.
- *    `5` 는 라이브가 **없다**. 백업만 남아 있고, 그것이 이전 빌드의 유일한 사본이다.
+ *    `1` 은 라이브가 **온전하다**(건드리기 전이거나, 되돌렸다). 사람이 할 일이 없다.
+ *    `5` 는 라이브가 **온전하지 않다**. 사람이나 롤백이 개입해야 한다.
+ *
+ * 방식마다 `5` 의 모양이 다르다 (#P003).
+ *    swap  라이브 폴더가 **없다**. `_org_` 를 되돌리지 못했다
+ *    copy  라이브가 **섞였다**. 옛 빌드 반, 새 빌드 반 — 확정 zip 으로 덮어야 한다
  */
 const DEPLOY = {
   ...COMMON,
   1: '배포 실패 - 라이브는 이전 빌드로 살아 있습니다',
-  5: '배포에 실패했고 되돌리지도 못했습니다 - 라이브 폴더가 없습니다'
+  5: '배포에 실패했고 라이브가 온전하지 않습니다 - 되돌려야 합니다'
 };
+
+/** 방식을 아는 자리에서는 `5` 를 더 정확히 말한다. 모르면 위의 공통 문구를 쓴다. */
+function deployReason(code, mode) {
+  if (code === 5 && mode === 'copy') {
+    return '복사 도중 실패 - 라이브에 옛 빌드와 새 빌드가 섞였습니다';
+  }
+  if (code === 5 && mode === 'swap') {
+    return '배포에 실패했고 되돌리지도 못했습니다 - 라이브 폴더가 없습니다';
+  }
+  return reasonFor(DEPLOY, code);
+}
 
 /**
  * `rollback.bat` — 백업본 복귀.
@@ -69,4 +84,4 @@ function reasonFor(table, code) {
   return table[code] || `알 수 없는 종료코드 ${code}`;
 }
 
-module.exports = { COMMON, WEBSERVER, DEPLOY, ROLLBACK, PATCH, reasonFor };
+module.exports = { COMMON, WEBSERVER, DEPLOY, ROLLBACK, PATCH, reasonFor, deployReason };

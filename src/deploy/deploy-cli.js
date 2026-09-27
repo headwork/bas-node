@@ -18,6 +18,10 @@ const USAGE = `
   --project=<이름>       설정 프로젝트. 생략하면 YAML 의 project 를 쓴다
   --config-dir=<경로>    설정 폴더 직접 지정
 
+  --mode=copy|swap       이번 실행에만 배포 방식을 강제한다 (YAML 의 deploy_mode 보다 우선)
+                         copy = 기존 폴더에 덮어쓴다 (기본) · swap = 폴더를 갈아끼운다
+                         운영에서 누적된 옛 파일을 한 번 쓸어낼 때 swap 을 쓴다
+
   --rollback=<N>         배포 없이 롤백만 실행한다. N 은 성공 배포 역순 번호
                          1 = 직전 성공 배포의 백업으로 되돌린다 (2·3 은 그 이전)
                          이력이 N 보다 적으면 가장 오래된 것으로 조정한다
@@ -74,7 +78,7 @@ function parseArgs(argv) {
     yamlFile: null, params: {}, dryRun: false,
     only: null, deployKey: null, project: null, configDir: null,
     cancel: false, unlock: false, forceUnlock: false, status: false,
-    rollback: 0
+    rollback: 0, mode: null
   };
 
   for (const arg of argv) {
@@ -91,6 +95,15 @@ function parseArgs(argv) {
         process.exit(1);
       }
       a.rollback = n;
+    }
+    else if (arg.startsWith('--mode=')) {
+      const m = arg.slice('--mode='.length).toLowerCase();
+      if (m !== 'copy' && m !== 'swap') {
+        // 오타를 기본값으로 흘려보내면 **의도하지 않은 방식으로 배포된다.** 에러도 안 난다.
+        console.error(`--mode 는 copy 또는 swap 이어야 합니다: ${arg}`);
+        process.exit(1);
+      }
+      a.mode = m;
     }
     else if (arg === '--dry-run') a.dryRun = true;
     else if (arg === '--cancel') a.cancel = true;
@@ -295,8 +308,12 @@ async function main() {
   process.on('SIGINT', onSigint);
 
   try {
-    const engine = new PipelineEngine(args.params);
-    await engine.run(yamlPath, args.params, {
+    // `--mode` 는 **이번 실행에만** 걸리는 덮어쓰기다. 변수로 넣으면 그룹을 나눠 부를 때
+    // 이월되지 않아 앞 그룹과 뒤 그룹의 방식이 갈릴 수 있으므로, 젠킨스처럼 나눠 부르는
+    // 경우에는 그룹마다 같은 `--mode` 를 넘겨야 한다.
+    const params = args.mode ? { ...args.params, deploy_mode_override: args.mode } : args.params;
+    const engine = new PipelineEngine(params);
+    await engine.run(yamlPath, params, {
       dryRun: args.dryRun,
       only: args.only,
       deployKey,

@@ -1,6 +1,6 @@
-# 🟡 P202609_003: 배포 방식 옵션화 (복사 · 스왑) + preserve 분류
+# 🟢 P202609_003: 배포 방식 옵션화 (복사 · 스왑) + preserve 분류
 
-* **상태**: 🟡 기획/진행중
+* **상태**: 🟢 완료 (2026-09-23) — QA 실서버에서 두 방식·두 롤백 트랙 검증 완료
 * **선행 작업**: [#P002 배포 대상 범용화](../P202609_002_deploy_target_abstraction/spec.md) — `deploy.bat` · `rollback.bat` · `scriptExit.js` 계약이 이 과제의 기반이다
 * **선행 문서**: [06 배포 스크립트 규약](../../../design/배포/06_배포_스크립트_규약.md) · [02 운영 배포 흐름](../../../design/배포/02_운영_배포_흐름.md)
 
@@ -79,12 +79,21 @@
 
 ## 5. 현행화 및 후행 작업
 
-* **현행화 대상**: [01 로컬 배포 흐름](../../../design/배포/01_로컬_배포_흐름.md) ·
+* **변경 파일** (2026-09-23)
+  * 신규: `src/deploy/preserveClassify.js` · `deployMode.js` · `decodeOutput.js` · `lockDiag.js` ·
+    `stages/ConfirmStage.js`
+  * 수정: `PipelineEngine.js`(요약 로그 `[이번 배포]` · `confirm` 등록 · 롤백 목록 일원화) ·
+    `backupRetention.js`(`backupDirFor`·`siteNameFrom`·`matchByPattern`) · `deployState.js` ·
+    `deploy-cli.js`(`--mode`) · `scriptArgs.js` · `scriptExit.js` · 매크로 4종
+  * 스크립트: `deploy.bat`(`DP_MODE` 분기) · `rollback.bat`(원본 둘) · `webserver_iis.bat`(`:wait_wp`)
+  * 젠킨스: `plWesysDeployNode`(`MODE` 파라미터) · **`plWesysRollbackNode` 신설**
+* **현행화 완료** (2026-09-23): [README](../../../design/배포/README.md) ·
+  [01 로컬 배포 흐름](../../../design/배포/01_로컬_배포_흐름.md) ·
   [02 운영 배포 흐름](../../../design/배포/02_운영_배포_흐름.md) ·
-  [06 배포 스크립트 규약](../../../design/배포/06_배포_스크립트_규약.md)(종료코드 표) ·
-  [deploy_shore.yaml](../../../design/template/deploy_shore.yaml) · [deploy_sample.yaml](../../../design/template/deploy_sample.yaml)
-  * 가이드에 **clean 빌드와 누적 빌드의 차이**를 설명한다(#P003-OQ4 확정 — 도구는 검사하지 않는다).
-    누적 빌드는 zip 자체에 옛 파일이 들어가므로 스왑으로도 지워지지 않는다.
+  [04 젠킨스 잡](../../../design/배포/04_젠킨스_잡.md) ·
+  [06 배포 스크립트 규약](../../../design/배포/06_배포_스크립트_규약.md) ·
+  [deploy_shore.yaml](../../../design/template/deploy_shore.yaml)
+  * clean · 누적 빌드 설명은 [README](../../../design/배포/README.md#배포-방식--copy--swap) 에 넣었다.
 * **작업 목록**: [task.md](task.md)
 * **후행 작업 (백로그 등록)**:
   * 확정 zip 을 도구 서버에도 둘지 (현재 안은 배포서버 한 곳. 서버가 죽으면 롤백 원본도 같이 죽는다)
