@@ -21,6 +21,11 @@ server_list:
     profile_dir: "${project_root}/config"             # yaml · 빌드 스크립트 · pubxml 이 사는 곳
 
     build_cwd: "${source_path}/${project_name}/Web"
+    # 저장소의 게시 프로파일을 그대로 쓴다. build_shore.bat 이 사본을 떠 PublishUrl 만
+    # build_path 로 바꾼다. 서버별 pubxml 사본은 경로 외에 차이가 없었고, 그 사본에 남은
+    # TargetFramework=net6.0 이 net8.0 전환을 깨뜨렸다(NU1202, 2026-09-30).
+    # build_cwd 기준 상대경로다 — BuildStage 가 build_cwd 에서 명령을 돌린다.
+    build_profile: "Properties/PublishProfiles/FolderProfile.pubxml"
     build_cmd: "\"${profile_dir}\\build_shore.bat\" \"${build_profile}\" \"${build_path}\""
 
     # 이 블록은 배포 대상으로도 쓰인다(dev). 그때 필요한 값들.
@@ -61,8 +66,8 @@ server_list:
   prod_server: &prod_server
     <<: *qa_server
     server_name: "prod_deploy"
-    web_deploy_path: "D:/Deploy/${project_name}"
-    web_server_name: "${project_name2}"
+    web_deploy_path: "D:/Deploy/${project_name}_TEST"
+    web_server_name: "${project_name2}_TEST"
     health_url: "https://wesys.hls.co.kr/healthz"
     # 운영은 기존 방식(복사)을 유지한다. 누적된 옛 파일을 쓸어낼 때만
     # `--mode=swap` 으로 한 번 돌린다 — yaml 을 고치면 고친 채로 남는다.
@@ -90,7 +95,6 @@ target:
     # ⚠️ 폴더 이름은 **여기가 정본**이다. build_shore.bat 이 프로파일 사본의 PublishUrl 을
     #    이 값으로 덮으므로 pubxml 과 어긋날 일이 없다.
     build_path: "${build_root}/${project_name}_QA"
-    build_profile: "${profile_dir}/wesysProfileDev.pubxml"
 
     deploy_server: *local_jenkins
     deploy_remote: false        # 이 서버 안에서 끝낸다
@@ -102,7 +106,6 @@ target:
     branch: "deploy/qa"
     build_server: *local_jenkins
     build_path: "${build_root}/${project_name}_QA"
-    build_profile: "${profile_dir}/wesysProfileQA.pubxml"
 
     deploy_server: *qa_server
     confluence: false
@@ -111,8 +114,7 @@ target:
   prod:
     branch: "master"
     build_server: *local_jenkins_prod
-    build_path: "${build_root}/${project_name}"
-    build_profile: "${profile_dir}/wesysProfilePord.pubxml"
+    build_path: "${build_root}/${project_name}_TEST"
 
     deploy_server: *prod_server
     confluence: false

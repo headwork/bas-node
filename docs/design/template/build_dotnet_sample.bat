@@ -6,12 +6,20 @@ rem Called by the deploy pipeline (BuildStage) with the working directory
 rem already set to the project folder (build_cwd), so this script does not cd.
 rem
 rem   usage: build_shore.bat <pubxml path> [publish url] [csproj]
-rem   e.g.   build_shore.bat "D:/Deploy/jenkins/project_hlngs/wesysProfileDev.pubxml" ^
+rem   e.g.   build_shore.bat "Properties/PublishProfiles/FolderProfile.pubxml" ^
 rem                          "D:/Deploy/build/MFM.SHORE_QA"
 rem
-rem The publish profile is copied into <cwd>\Properties\PublishProfiles\ and
-rem passed to dotnet by NAME. A full path makes the SDK skip publishing with
-rem NETSDK1198 while still exiting 0 - the old artifact then gets deployed.
+rem The pubxml path may be relative to the project folder (cwd), so the profile
+rem committed in the repo can be used as-is. Server-side copies are not needed:
+rem they differed from FolderProfile only in PublishUrl, and a stale copy is how
+rem TargetFramework=net6.0 survived the net8.0 upgrade (NU1202, 2026-09-30).
+rem
+rem The publish profile is copied into <cwd>\Properties\PublishProfiles\ under
+rem the fixed name _pipeline.pubxml and passed to dotnet by NAME. A full path makes
+rem the SDK skip publishing with NETSDK1198 while still exiting 0 - the old
+rem artifact then gets deployed. A fixed name is also what lets the source sit
+rem in that same folder: `copy` onto itself fails ("cannot be copied onto
+rem itself", exit 1), and editing the tracked file would dirty the checkout.
 rem
 rem When a publish url is given, it is written into that COPY so the pipeline
 rem decides where the output lands. The original profile is left untouched.
@@ -31,7 +39,7 @@ if "%PROJECT%"=="" set PROJECT=MFM.Shore.csproj
 
 if "%SRC%"=="" (
   echo [build_shore] publish profile path is required.
-  echo [build_shore]   usage: build_shore.bat "<dir>\wesysProfileDev.pubxml" [publish url] [csproj]
+  echo [build_shore]   usage: build_shore.bat "Properties/PublishProfiles/FolderProfile.pubxml" [publish url] [csproj]
   exit /b 1
 )
 
@@ -42,18 +50,17 @@ if not exist "%SRC%" (
   exit /b 1
 )
 
-rem %%~nF = file name without extension. That NAME is what PublishProfile wants.
-rem %%~nxF = name with extension, used to address the copy we are about to make.
-for %%F in ("%SRC%") do (
-  set PROFILE=%%~nF
-  set PROFILE_FILE=%%~nxF
-)
+rem Untracked file; git_sync's `checkout -f` leaves it alone and we overwrite
+rem it every run. PROFILE (no extension) is the NAME PublishProfile wants.
+set COPY_NAME=_pipeline
+set PROFILE=%COPY_NAME%
+set PROFILE_FILE=%COPY_NAME%.pubxml
 
 set DEST=%CD%\Properties\PublishProfiles
 if not exist "%DEST%" mkdir "%DEST%"
-copy /y "%SRC%" "%DEST%\" > nul
+copy /y "%SRC%" "%DEST%\%PROFILE_FILE%" > nul
 if errorlevel 1 (
-  echo [build_shore] failed to copy publish profile: %SRC% -^> %DEST%
+  echo [build_shore] failed to copy publish profile: %SRC% -^> %DEST%\%PROFILE_FILE%
   exit /b 1
 )
 
@@ -72,6 +79,9 @@ if "%PUBURL%"=="" goto skipUrl
 
 rem yaml keeps paths with forward slashes; the pubxml wants backslashes.
 set PUBURL=%PUBURL:/=\%
+rem Drop a trailing backslash. The rewrite itself is fine with it, but findstr
+rem reads "\<" in the check below as an escape and reports a false failure.
+if "%PUBURL:~-1%"=="\" set PUBURL=%PUBURL:~0,-1%
 set PROFILE_COPY=%DEST%\%PROFILE_FILE%
 
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$f='%PROFILE_COPY%'; $c=Get-Content -Raw -LiteralPath $f; $c=[regex]::Replace($c,'<PublishUrl>.*?</PublishUrl>','<PublishUrl>%PUBURL%</PublishUrl>'); Set-Content -LiteralPath $f -Value $c -Encoding UTF8 -NoNewline"
@@ -100,6 +110,12 @@ echo [build_shore] project = %PROJECT%
 echo [build_shore] profile = %PROFILE%  (%SRC%)
 if not "%PUBURL%"=="" echo [build_shore] pub url = %PUBURL%
 if "%PUBURL%"=="" echo [build_shore] pub url = (profile default)
+
+rem Log which dotnet and which SDK actually run. The Jenkins service account
+rem can see a different PATH than an interactive `where dotnet` does, and a
+rem too-old SDK only shows up later as NETSDK1045 on the target framework.
+echo [build_shore] dotnet  = %DOTNET_EXE%
+for /f "delims=" %%V in ('"%DOTNET_EXE%" --version 2^>nul') do echo [build_shore] sdk     = %%V
 
 "%DOTNET_EXE%" build "%PROJECT%" -c Release /p:DeployOnBuild=true /p:PublishProfile=%PROFILE%
 if errorlevel 1 (
